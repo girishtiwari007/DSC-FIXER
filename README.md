@@ -50,3 +50,26 @@ Replacement MSI availability/content/version is checked before DSS is stopped or
 ### Release regression checks
 
 Run `powershell.exe -NoProfile -STA -File .\tests\Test-Release.ps1` where local policy permits. Tests use isolated TEMP fixtures, mocked repair operations, and harmless child processes to check exit/timeout handling. They parse scripts, verify payload/checksum consistency, exercise failure paths and report privacy, and construct WinForms controls without showing a dashboard or running repairs. They do not certify real installation, signing, UAC, network availability or antivirus acceptance. Temporary test logs are retained for inspection. Execution policy is not changed.
+
+
+## Ordered workflow (2026.10.26.3; local testing)
+
+Both GUI and PowerShell console use the same sequence, continuing even when isLive succeeds:
+
+1. Open isLive and require `success. DSC Signer Service version : 4.1.8`. A date-expiry-only certificate alert is a non-blocking warning for exactly `https://eoffsigner.eoffice.gov.in:55101/check/isLive`; name mismatch, unknown roots and other errors are not ignored.
+2. Verify `C:\Program Files\Digital Signer Service\4.1.8\Digital Signer Service.exe` exists. Another installation directory does not satisfy this check.
+3. Check PATH/environment cleanup; selected repairs keep backups.
+4. Check Java execution and suitable installed Java. Keep working Java without an update prompt.
+5. Check port 55101 and identify its listener.
+6. Where installation/repair is needed, prepare and automatically validate the package. Only FIXR's online/batch edition supports downloading DSS, using a session-named package under Downloads\DSC-Signer-4.1.8. DSC-FIX, DSC-FIXER and FIXR native remain local-package editions; inherited downloader variables cannot enable a DSS download. Installation still requires selecting a repair. Check-only mode does not download.
+7. Indicate an available Java update as optional: a flashing GUI button or highlighted console option. No upgrade is included in Fix All for working Java.
+8. Complete process, hosts and browser checks; then offer selected repairs and optional reporting.
+
+The Browser exception button provides guidance for Advanced/Proceed or Add Exception for the signer address where the browser offers it. It does not automate interstitial clicks, bypass browser-enforced restrictions, disable validation globally or store browser-wide trust exceptions. Accepted expiry warnings remain visible in reports/logs.
+
+Run `tests\Test-Release.ps1` for the release regression suite and `tests\Test-StartupSequence.ps1` for the ordered-workflow suite. These use fixtures; real installation/signing/browser exceptions need local testing. No commits or pushes were made.
+
+
+## Live-test corrections (2026.10.26.4)
+
+Visible check numbers now run 1–10 in workflow order; stable internal IDs remain in logs. GUI rows update by their identity instead of the old list index. isLive readiness is independent of supplemental issues: confirmed success, including the accepted signer expiry warning, displays WORKING. Other issues remain visible in their own rows; unavailable probes are warnings, not evidence of service failure. Java version output is read from both native process streams. Empty browser output is explicitly unverified and does not propose an automatic repair.

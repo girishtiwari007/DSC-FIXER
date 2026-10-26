@@ -83,7 +83,7 @@ foreach ($file in $files) {
             $Cfg=@{JavaManualUrl='https://www.java.com/en/download/manual.jsp'}
             $script:Use64Bit=$false; Assert (-not (Test-JavaLatest).Pass) "$label rejects offline 32-bit Java"
             $script:Use64Bit=$true; $r=Test-JavaLatest
-            Assert ($r.Pass -and $r.Warn) "$label keeps offline 64-bit Java with warning"
+            Assert ($r.Pass -and -not $r.Warn) "$label keeps installed 64-bit Java without an update prompt"
             . ([scriptblock]::Create((Get-FunctionText $ast 'Repair-DssInstall')))
             $script:Stopped=0;$script:Calls=@();$script:Actions=@();$script:HasPackage=$false;$script:Valid=$true;$script:ExitCode=0
             $script:RequestPackage=$null;$TestMode=$false;$RunDir=$env:DSSF_TESTROOT
@@ -126,7 +126,7 @@ foreach ($file in $files) {
                 @{No=2;T={@{Pass=$true;Value='ok';Info=@('ok')}};R=[pscustomobject]@{No=2;Status='PENDING';Before='';BeforeValue='';Value='';Advice=''}}
             )
             Invoke-AllTests
-            Assert ($Defs[0].R.Status -eq 'FAIL' -and $Defs[1].R.Status -eq 'OK') "$label diagnostics continue after an exception"
+            Assert ($Defs[0].R.Status -eq 'WARN' -and $Defs[1].R.Status -eq 'OK') "$label diagnostics continue after an exception"
         } $ast ($file.Directory.Name+'/'+$file.Name)
     }
     if ($file.Name -eq 'install.ps1' -and $file.Directory.Name -eq 'DSC-FIX') {

@@ -13,7 +13,7 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
 # Session logging is embedded so each published entry point remains self-contained.
 function Initialize-DscSession([string]$Repository, [string]$ModeName) {
     $script:DscSession = [ordered]@{
-        Schema = 1; ToolVersion = '2026.10.26.1'; Repository = $Repository
+        Schema = 1; ToolVersion = '2026.10.26.4'; Repository = $Repository
         SessionId = [guid]::NewGuid().ToString('N'); StartedUtc = [DateTime]::UtcNow.ToString('o')
         UpdatedUtc = ''; Mode = $ModeName; PowerShell = $PSVersionTable.PSVersion.ToString()
         State = 'Running'; ErrorCount = 0; Checks = @(); Improvements = @()
@@ -182,7 +182,7 @@ $TestRoot = $env:DSSF_TESTROOT
 $TestMode = -not [string]::IsNullOrEmpty($TestRoot)
 $CheckOnly = ($RequestedMode -eq 'check')
 $Mode = $(if ($RequestedMode -eq 'gui') { 'gui' } else { 'console' })
-$script:Ui = $null
+$script:Ui = $null; $script:UiJavaOffer = $null
 $script:UiLog = $null
 $script:UiStatus = $null
 $script:UiRow = $null
@@ -205,13 +205,14 @@ $Cfg = [ordered]@{
     StartWaitSeconds    = 60
     OpenReport          = $true
     # optional: where to download the 4.1.8 installer zip if it is not on this PC (set by install.ps1 / GitHub)
+    AllowDssDownload    = $false
     PackageUrl          = ''
     PackageSha256       = ''
 }
 # where DigitalSignerService 4.1.8 lives on a normal install - checked FIRST for item 3
-$Cfg.DssExePaths = @("$env:ProgramFiles\Digital Signer Service\$($Cfg.DssVersion)\Digital Signer Service.exe",
-                     "${env:ProgramFiles(x86)}\Digital Signer Service\$($Cfg.DssVersion)\Digital Signer Service.exe")
-if ($env:DSSF_PKGURL) { $Cfg.PackageUrl = $env:DSSF_PKGURL }
+$Cfg.RequiredDssPath = 'C:\Program Files\Digital Signer Service\4.1.8\Digital Signer Service.exe'
+$Cfg.DssExePaths = @($Cfg.RequiredDssPath)
+if ($Cfg.AllowDssDownload -and $env:DSSF_PKGURL) { $Cfg.PackageUrl = $env:DSSF_PKGURL }
 if ($env:DSSF_PKGSHA256) { $Cfg.PackageSha256 = $env:DSSF_PKGSHA256 }
 
 # ---------------------------------------------------------------- test harness hooks
@@ -255,38 +256,75 @@ if (-not $TestMode -and $env:SystemRoot) {
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { Write-DscError $_ 'Caught exception';}
 
 # ---------------------------------------------------------------- HTTPS helper (strict = Windows certificate trust)
-if (-not ('DssfHttp' -as [type])) {
+if (-not ('DssfHttpV3' -as [type])) {
 try { Add-Type -IgnoreWarnings -WarningAction SilentlyContinue -ErrorAction Stop -TypeDefinition @'
 using System;
 using System.IO;
 using System.Net;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
-public class DssfHttpResult {
+public class DssfHttpResultV3 {
     public bool Ok; public int Status; public string Body = ""; public string Error = "";
     public string Kind = ""; public string SslErrors = ""; public byte[] CertRaw;
+    public bool CertificateTrusted; public bool ExpiredAccepted;
 }
-public static class DssfHttp {
-    public static DssfHttpResult Get(string url, bool strict, int timeoutMs) {
-        DssfHttpResult r = new DssfHttpResult();
+public static class DssfHttpV3 {
+    public static bool IsExpiryOnly(string url, SslPolicyErrors errors, X509ChainStatusFlags[] statuses,
+                                    DateTime[] starts, DateTime[] ends, DateTime now) {
+        Uri u;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out u) || u.Scheme != "https" ||
+            !String.Equals(u.Host, "eoffsigner.eoffice.gov.in", StringComparison.OrdinalIgnoreCase) ||
+            u.Port != 55101 || u.AbsolutePath != "/check/isLive" || !String.IsNullOrEmpty(u.UserInfo) ||
+            !String.IsNullOrEmpty(u.Query) || !String.IsNullOrEmpty(u.Fragment)) return false;
+        if (errors != SslPolicyErrors.RemoteCertificateChainErrors || statuses == null || statuses.Length == 0 ||
+            starts == null || ends == null || starts.Length == 0 || starts.Length != ends.Length) return false;
+        bool hasTimeError = false, expired = false;
+        foreach (X509ChainStatusFlags flag in statuses) {
+            if (flag == X509ChainStatusFlags.NotTimeValid) hasTimeError = true;
+            else if (flag != X509ChainStatusFlags.NoError) return false;
+        }
+        for (int i = 0; i < starts.Length; i++) {
+            if (starts[i].ToUniversalTime() > now.ToUniversalTime()) return false;
+            if (ends[i].ToUniversalTime() < now.ToUniversalTime()) expired = true;
+        }
+        return hasTimeError && expired;
+    }
+    public static DssfHttpResultV3 Get(string url, bool strict, int timeoutMs) { return Get(url, strict, timeoutMs, false); }
+    public static DssfHttpResultV3 Get(string url, bool strict, int timeoutMs, bool allowExpiredSigner) {
+        DssfHttpResultV3 r = new DssfHttpResultV3();
         try {
             HttpWebRequest q = (HttpWebRequest)WebRequest.Create(url);
             q.Proxy = null; q.Timeout = timeoutMs; q.ReadWriteTimeout = timeoutMs; q.KeepAlive = false;
-            q.ServerCertificateValidationCallback = delegate(object s, X509Certificate c, X509Chain ch, SslPolicyErrors e) {
-                if (c != null) { r.CertRaw = c.GetRawCertData(); }
-                r.SslErrors = e.ToString();
-                return strict ? (e == SslPolicyErrors.None) : true;
+            // An exception is never carried across redirects to another endpoint.
+            if (allowExpiredSigner) q.AllowAutoRedirect = false;
+            q.ServerCertificateValidationCallback = delegate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
+                if (cert != null) r.CertRaw = cert.GetRawCertData();
+                r.SslErrors = errors.ToString();
+                r.CertificateTrusted = errors == SslPolicyErrors.None;
+                if (r.CertificateTrusted) return true;
+                if (!strict) return true; // Used only by existing diagnostic probes, not by the isLive verdict.
+                if (allowExpiredSigner && cert != null && chain != null) {
+                    X509ChainStatusFlags[] flags = new X509ChainStatusFlags[chain.ChainStatus.Length];
+                    for (int i = 0; i < flags.Length; i++) flags[i] = chain.ChainStatus[i].Status;
+                    DateTime[] starts = new DateTime[chain.ChainElements.Count], ends = new DateTime[chain.ChainElements.Count];
+                    for (int i = 0; i < starts.Length; i++) {
+                        starts[i] = chain.ChainElements[i].Certificate.NotBefore;
+                        ends[i] = chain.ChainElements[i].Certificate.NotAfter;
+                    }
+                    if (IsExpiryOnly(url, errors, flags, starts, ends, DateTime.UtcNow)) { r.ExpiredAccepted = true; return true; }
+                }
+                return false;
             };
             using (HttpWebResponse resp = (HttpWebResponse)q.GetResponse()) {
                 r.Status = (int)resp.StatusCode;
-                using (StreamReader sr = new StreamReader(resp.GetResponseStream())) { r.Body = sr.ReadToEnd(); }
+                using (StreamReader sr = new StreamReader(resp.GetResponseStream())) r.Body = sr.ReadToEnd();
             }
-            r.Ok = (r.Status == 200);
+            r.Ok = r.Status == 200;
         } catch (WebException ex) {
             r.Kind = ex.Status.ToString(); r.Error = ex.Message;
-            if (ex.InnerException != null) { r.Error += " | " + ex.InnerException.Message; }
+            if (ex.InnerException != null) r.Error += " | " + ex.InnerException.Message;
             HttpWebResponse er = ex.Response as HttpWebResponse;
-            if (er != null) { r.Status = (int)er.StatusCode; }
+            if (er != null) { r.Status = (int)er.StatusCode; er.Close(); }
         } catch (Exception ex) { r.Kind = "Other"; r.Error = ex.Message; }
         return r;
     }
@@ -645,7 +683,7 @@ function Get-WebFileResume([string]$Url, [string]$OutFile, [int]$Tries = 4) {
             $out = New-Object IO.FileStream($part, $(if ($append) { [IO.FileMode]::Append } else { [IO.FileMode]::Create }), [IO.FileAccess]::Write)
             $buf = New-Object byte[] 1MB; $done = $have; $last = [DateTime]::MinValue
             while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
-                $out.Write($buf, 0, $n); $done += $n
+                $out.Write($buf, 0, $n); $done += $n; Update-Ui
                 if (((Get-Date) - $last).TotalMilliseconds -gt 700) {
                     $last = Get-Date
                     $pct = $(if ($total -gt 0) { [int](100 * $done / $total) } else { 0 })
@@ -721,8 +759,10 @@ function Export-BatPayload([string]$Bat, [string]$OutZip) {
 # fetch the 4.1.8 installer from $Cfg.PackageUrl (set by the online setup) only when a fix needs it.
 # Accepts a zip that holds the msi, OR a zip that holds the single-file tool (.bat with the installer inside).
 function Get-DssPackageFromWeb {
-    if (-not $Cfg.PackageUrl) { return $false }
-    $zip = Join-Path $RunDir 'web-package.zip'
+    if (-not $Cfg.AllowDssDownload -or -not $Cfg.PackageUrl) { return $false }
+    $downloadDir = Join-Path (Get-DownloadsFolder) 'DSC-Signer-4.1.8'
+    [void][IO.Directory]::CreateDirectory($downloadDir)
+    $zip = Join-Path $downloadDir ('DSS-4.1.8-' + $script:DscSession.SessionId + '.zip')
     Say "      Downloading the DigitalSignerService $($Cfg.DssVersion) package from $($Cfg.PackageUrl) (about 100 MB) ..."
     if ($TestMode -and $Cfg.PackageUrl -notmatch '^https?:') { Copy-Item -LiteralPath $Cfg.PackageUrl -Destination $zip }
     else {
@@ -731,7 +771,7 @@ function Get-DssPackageFromWeb {
     }
     if ($Cfg.PackageSha256) {
         $h = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
-        if ($h -ne $Cfg.PackageSha256.ToUpper()) { throw 'Installer package SHA256 mismatch. Download rejected.' }
+        if ($h -ne $Cfg.PackageSha256.ToUpper()) { Move-Item -LiteralPath $zip -Destination ($zip + '.rejected') -Force -ErrorAction Stop; throw 'Installer package SHA256 mismatch. Archive quarantined with .rejected extension.' }
     }
     $x = Test-PackagePath $zip
     if (-not $x) {
@@ -747,7 +787,9 @@ function Get-DssPackageFromWeb {
         if (-not $m -or ($m.Version -and $m.Version -ne $Cfg.DssVersion)) { Say "      The downloaded package does not contain DigitalSignerService $($Cfg.DssVersion)." 'Red'; return $false }
         $zip = $m.Path
     }
-    Say '      Package downloaded and checked.' 'Cyan'
+    $validation = Test-PackageValid $zip
+    if (-not $validation.Ok) { throw ('Downloaded installer validation failed: ' + $validation.Text) }
+    Say '      Package downloaded to Downloads and automatically validated.' 'Cyan'
     $script:PkgOverride = $zip; $script:PkgMsi = $null; $script:PkgSkipped = $false
     return $true
 }
@@ -884,13 +926,18 @@ function Get-Color([string]$st) {
 function Show-Row($r) {
     $t = $r.Title; if ($t.Length -gt 48) { $t = $t.Substring(0, 48) }
     $v = $r.Value; if ($v.Length -gt 88) { $v = $v.Substring(0, 88) + '...' }
-    Write-Host ('  {0,2}  ' -f $r.No) -NoNewline
+    Write-Host ('  {0,2}  ' -f $r.DisplayNo) -NoNewline
     Write-Host ('{0,-10}' -f (Get-Label $r.Status)) -ForegroundColor (Get-Color $r.Status) -NoNewline
     Write-Host (' {0,-49}' -f $t) -NoNewline
     Write-Host $v -ForegroundColor DarkCyan
     Log ("  [{0}] {1} {2} | {3}" -f $r.No, (Get-Label $r.Status), $r.Title, $r.Value)
 }
 function Set-FromTest($r, $t) {
+    if ($t.DiagnosticError -or $t.Inconclusive) {
+        $r | Add-Member -NotePropertyName Fixable -NotePropertyValue $false -Force
+        $r.Status='WARN'; $r.Value='Diagnostic not verified; see log'; $r.Advice='No repair is inferred from an unavailable diagnostic.'
+        return
+    }
     $r | Add-Member -NotePropertyName Fixable -NotePropertyValue ([bool]($t.Fixable -or -not $t.Pass)) -Force
     if ($t.NA) { $r.Status = 'NA' } elseif ($t.Pass) { $r.Status = $(if ($t.Warn) { 'WARN' } else { 'OK' }) } else { $r.Status = 'FAIL' }
     if ($t.Value -and ($t.Pass -or $t.NA)) { $r.Value = $t.Value } elseif (-not $t.Pass -and $t.FailValue) { $r.Value = $t.FailValue } elseif ($t.Info) { $r.Value = @($t.Info)[0] } else { $r.Value = '' }
@@ -1085,19 +1132,13 @@ function Get-InstalledJava {
     return $res
 }
 function Test-JavaLatest {
-    $lat = Get-JavaLatest
-    $inst = @(Get-InstalledJava)
-    $best = $inst | Where-Object { $_.Major -eq 8 -and $_.Is64 } | Sort-Object Update -Descending | Select-Object -First 1
-    if (-not $best) { $best = $inst | Where-Object { $_.Major -eq 8 } | Sort-Object Update -Descending | Select-Object -First 1 }
-    $info = @()
-    if ($inst.Count) { $info += 'Installed: ' + (($inst | ForEach-Object { $_.Name }) -join '; ') } else { $info += 'Java Runtime is not installed' }
-    if ($lat.Update -gt 0) { $info += "Latest on java.com: Java 8 Update $($lat.Update)" }
-    else { $info += "Could not read latest version from java.com (no internet or page changed) $($lat.Error)" }
-    if (-not $best) { return @{ Pass = $false; Info = $info; Advice = "Install Java manually from $($Cfg.JavaManualUrl) (Windows Offline 64-bit)." } }
-    if (-not $best.Is64) { return @{ Pass = $false; Info = $info + 'Only 32-bit Java found, 64-bit needed'; Advice = "Install Java 64-bit from $($Cfg.JavaManualUrl)." } }
-    if ($lat.Update -eq 0) { return @{ Pass = $true; Warn = $true; Value = "Java 8 Update $($best.Update) (latest not checked - offline)"; Info = $info + 'Internet check not possible - installed Java kept' } }
-    if ($best.Update -lt $lat.Update) { return @{ Pass = $false; Info = $info + "Installed Update $($best.Update) is older than $($lat.Update)"; Advice = "Install the latest Java (Windows Offline 64-bit) from $($Cfg.JavaManualUrl)." } }
-    return @{ Pass = $true; Value = "Java 8 Update $($best.Update) (64-bit) = latest"; Info = @("Java 8 Update $($best.Update) (64-bit) installed = latest") }
+    # Historical function name retained; this check deliberately does not fetch update metadata.
+    $installed = @(Get-InstalledJava)
+    $best = $installed | Where-Object { $_.Major -eq 8 -and $_.Is64 } | Sort-Object Update -Descending | Select-Object -First 1
+    if (-not $best) {
+        return @{ Pass = $false; Info = @('A suitable Java 8 64-bit installation was not found.'); Advice = 'Locate or install suitable Java 8 64-bit; updating working Java is optional.' }
+    }
+    return @{ Pass = $true; Value = "Java 8 Update $($best.Update) (64-bit) installed"; Info = @('Existing Java retained. Update checks are deferred to the optional indicator.') }
 }
 function Install-JavaLatest($r) {
     $lat = Get-JavaLatest
@@ -1140,33 +1181,19 @@ function Find-JavaOnPath {
     return $null
 }
 function Test-JavaWorks {
-    $exe = Find-JavaOnPath
-    if (-not $exe) { return @{ Pass = $false; Info = @("'java' command not found on PATH"); Kind = 'nopath'; Advice = 'Reinstall Java from java.com.' } }
-    $out = ''; $code = -1
-    try {
-        $saved = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $out = (& $exe -version 2>&1 | ForEach-Object { "$_" }) -join ' '
-        $code = $LASTEXITCODE; $ErrorActionPreference = $saved
-    } catch { Write-DscError $_ 'Caught exception'; $out = $_.Exception.Message }
-    $ver = ''; if ($out -match 'version\s+"([^"]+)"') { $ver = $matches[1] }
-    if ($code -ne 0 -or -not $ver) { return @{ Pass = $false; Info = @("java -version failed (exit $code): $out"); Kind = 'broken'; Exe = $exe; Advice = 'Uninstall all Java versions from Control Panel, reboot, then run this tool again.' } }
-    $info = @("java -version OK: $ver  ($exe)")
-    if ($out -match 'Picked up') { return @{ Pass = $false; Info = @("Java prints 'Picked up ...' - an options variable is still active"); Kind = 'options'; Exe = $exe } }
-    $upd = 0; if ($ver -match '^1\.8\.0_(\d+)') { $upd = [int]$matches[1] }
-    $best = Get-InstalledJava | Where-Object { $_.Major -eq 8 } | Sort-Object Update -Descending | Select-Object -First 1
-    if ($best -and $upd -gt 0 -and $upd -lt $best.Update) {
-        return @{ Pass = $false; Info = @("PATH runs older Java $ver, but Update $($best.Update) is installed"); Kind = 'order'; Exe = $exe; Best = $best }
+    $exe=Find-JavaOnPath
+    if(-not $exe){return @{Pass=$false;Info=@('Java command not found on PATH.');Kind='nopath';Advice='Select PATH/Java repair if required.'}}
+    $result=Invoke-JavaVersion $exe
+    $version='';if($result.Text -match 'version\s+"([^"]+)"'){$version=$matches[1]}
+    if($result.Code -ne 0 -or -not $version){return @{Pass=$false;Info=@("java -version failed (exit $($result.Code)): $($result.Text)");Kind='broken';Exe=$exe}}
+    if($result.Text -match 'Picked up'){return @{Pass=$false;Info=@('Java options variables are still active.');Kind='options';Exe=$exe}}
+    $information=@("java -version OK: $version ($exe)")
+    $dss=Find-DssExe
+    if($dss){
+        $bundled=Get-ChildItem -LiteralPath (Split-Path -Parent $dss) -Recurse -Depth 3 -File -ErrorAction SilentlyContinue | Where-Object {$_.Name -match '^java(\.exe)?$' -and $_.DirectoryName -match '(?i)bin$'} | Select-Object -First 1
+        if($bundled){$bundle=Invoke-JavaVersion $bundled.FullName;if($bundle.Code -ne 0){return @{Pass=$false;Info=@("Bundled Java failed: $($bundle.Text)");Kind='dssjre'}};$information+='Bundled Signer Java starts OK.'}
     }
-    # bundled JRE of the signer service (if any) must start too
-    $dss = Find-DssExe
-    if ($dss) {
-        $bj = Get-ChildItem -LiteralPath (Split-Path -Parent $dss) -Recurse -Depth 3 -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^java(\.exe)?$' -and $_.DirectoryName -match '(?i)bin$' } | Select-Object -First 1
-        if ($bj) {
-            $o2 = (& $bj.FullName -version 2>&1 | ForEach-Object { "$_" }) -join ' '
-            if ($LASTEXITCODE -eq 0) { $info += 'Signer Service bundled Java starts OK' } else { return @{ Pass = $false; Info = @("Signer Service bundled Java fails: $o2"); Kind = 'dssjre' } }
-        }
-    }
-    return @{ Pass = $true; Info = $info; Value = "java $ver runs OK" }
+    return @{Pass=$true;Info=$information;Value="java $version runs OK"}
 }
 function Repair-JavaWorks($r, $t) {
     switch ($t.Kind) {
@@ -1248,7 +1275,7 @@ function Test-DssInstall {
         $info += "Not found: $($Cfg.DssExePaths[0])"
         # 2) otherwise: installed somewhere else? (registry entry + program files)
         $other = Find-DssExe
-        if ($good.Count -and $other) { $installed = $true; $exe = $other; $where = Split-Path -Parent $other; $info += "DigitalSignerService $ver is installed in another folder: $where" }
+        if ($good.Count -and $other) { $info += "Found another installation at $other, but the required standard path is missing." }
         elseif ($good.Count) { $info += 'An installed entry exists but the program files are missing (broken install)' }
     }
     foreach ($o in $old) { $info += "Old/other version installed: $($o.DisplayName) (version $($o.DisplayVersion))" }
@@ -1259,14 +1286,14 @@ function Test-DssInstall {
     if (-not $pass) {
         $src = Find-DssPackageSource
         if ($src) { $info += "Installer ready: $($src.Text)" }
-        elseif ($Cfg.PackageUrl) { $info += "Installer not on this PC - it will be downloaded during Fix from $($Cfg.PackageUrl)" }
+        elseif ($Cfg.PackageUrl) { $info += "Installer not on this PC - it can be downloaded at step 6 from $($Cfg.PackageUrl)" }
         elseif ($notInst) { $info += "Installer package $ver NOT selected - use 'Locate installer' (zip, msi or folder)"; $pkgMissing = $true }
     }
     $fv2 = ''
     if ($notInst -and $old.Count) { $fv2 = "NOT INSTALLED in this system (old $($old[0].DisplayVersion) found)" }
     elseif ($notInst) { $fv2 = 'NOT INSTALLED in this system' }
     elseif ($old.Count) { $fv2 = "old version $($old[0].DisplayVersion) must be removed" }
-    if ($fv2) { if (Find-DssPackageSource) { $fv2 += '  |  installer ready' } elseif ($Cfg.PackageUrl) { $fv2 += '  |  installer will be downloaded during Fix' } elseif ($notInst) { $fv2 += '  |  installer NOT selected' } }
+    if ($fv2) { if (Find-DssPackageSource) { $fv2 += '  |  installer ready' } elseif ($Cfg.PackageUrl) { $fv2 += '  |  installer can be prepared at step 6' } elseif ($notInst) { $fv2 += '  |  installer NOT selected' } }
     return @{ Pass = [bool]$pass; Info = $info; Value = $val; FailValue = $fv2; NotInstalled = $notInst; Old = $old; Good = $good; Exe = $exe; PkgMissing = $pkgMissing
               Advice = "Use 'Locate installer' to pick the DigitalSignerService $ver zip/msi/folder, then Fix again." }
 }
@@ -1339,9 +1366,9 @@ function Test-CertChainMock([byte[]]$raw) {
     return ($san -match [regex]::Escape($Cfg.SignerHost) -or $leaf.Subject -match [regex]::Escape($Cfg.SignerHost))
 }
 function Invoke-IsLive {
-    $strict = [DssfHttp]::Get($Cfg.IsLiveUrl, (-not $TestMode), 8000)
-    if ($TestMode -and $strict.Ok -and -not (Test-CertChainMock $strict.CertRaw)) { $strict.Ok = $false; $strict.Kind = 'TrustFailure'; $strict.Error = 'certificate not trusted (mock store)' }
-    return $strict
+    $result = [DssfHttpV3]::Get($Cfg.IsLiveUrl, $true, 8000, $true)
+    if ($TestMode -and $result.Ok -and -not (Test-CertChainMock $result.CertRaw)) { $result.Ok=$false; $result.Kind='TrustFailure'; $result.Error='certificate not trusted (mock store)' }
+    return $result
 }
 $script:NotSecure = $null
 function Get-CertReason([byte[]]$raw, [string]$sslErr) {
@@ -1357,36 +1384,67 @@ function Get-CertReason([byte[]]$raw, [string]$sslErr) {
     } catch { Write-DscError $_ 'Caught exception';}
     return $why
 }
+function Test-DscLiveResponse([string]$Body) {
+    return ($Body -match '(?i)\bsuccess\b' -and $Body -match ('(?<![\d.])' + [regex]::Escape($Cfg.DssVersion) + '(?![\d.])'))
+}
+function Open-StartupBrowser {
+    Write-DscEvent 'Info' 'Startup browser requested' @{ Url = $Cfg.IsLiveUrl }
+    if ($TestMode) { Log "OPEN DEFAULT $($Cfg.IsLiveUrl) [test]"; return $true }
+    try {
+        Start-Process -FilePath $Cfg.IsLiveUrl -ErrorAction Stop
+        return $true
+    } catch {
+        Write-DscError $_ 'Open startup browser'
+        Say ('Could not open the default browser. Open this address manually: ' + $Cfg.IsLiveUrl) 'Yellow'
+        return $false
+    }
+}
+function Invoke-StartupSequence([switch]$OpenBrowser, [switch]$FullCheck) {
+    # Read-only checks and package preparation first; selected repairs happen afterwards.
+    Say ''; Say 'STEP 1 - Open isLive and check success for DigitalSignerService 4.1.8.' 'White'
+    $opened = $false
+    if ($OpenBrowser) { $opened = Open-StartupBrowser }
+    Invoke-AllTests @(4)
+    $ready = ($Results['4'].Status -in 'OK','FIXED','WARN')
+    $script:DscSession['StartupReady'] = $ready
+    $script:DscSession['StartupBrowserOpened'] = $opened
+    Say ''; Say 'STEP 2 - Check the required Digital Signer Service installation path.' 'White'
+    Invoke-AllTests @(3)
+    Say ''; Say 'STEP 3 - Check PATH and environment cleanup (back up before selected repairs).' 'White'
+    Invoke-AllTests @(5)
+    Say ''; Say 'STEP 4 - Check Java execution, then installed Java. No update prompt.' 'White'
+    Invoke-AllTests @(7)
+    Invoke-AllTests @(1)
+    Say ''; Say 'STEP 5 - Check port 55101 and its listener.' 'White'
+    Invoke-AllTests @(2)
+    Say ''; Say 'STEP 6 - Prepare and automatically validate an installer only if needed.' 'White'
+    [void](Prepare-DscInstaller)
+    Say ''; Say 'STEP 7 - Optional Java update indicator.' 'White'
+    Update-JavaOffer
+    Say ''; Say 'STEP 8 - Check the service process, hosts and browser settings.' 'White'
+    try {
+        $processes = @(Get-DssProcesses)
+        Add-Detail $Results['4'] $(if ($processes.Count) { 'Signer process PIDs: ' + (($processes | ForEach-Object { $_.Id }) -join ', ') } else { 'Signer process is not running.' })
+    } catch { Write-DscError $_ 'Service process diagnostic' }
+    Invoke-AllTests @(6,8,9,10)
+    return $ready
+}
+
 function Test-IsLive {
-    $info = @()
-    $procs = @(Get-DssProcesses)
-    if ($procs.Count) { $info += "Signer Service process running (PID $(($procs | ForEach-Object { $_.Id }) -join ','))" } else { $info += 'Signer Service is not running' }
-    if (-not (Test-CaTrusted)) { $info += 'eOffice root certificate (eOfficeCA2022) missing from Trusted Root store' }
-    $res = Invoke-IsLive
-    if ($res.Ok -and $res.Body -match [regex]::Escape($Cfg.DssVersion)) {
-        $b = ($res.Body -replace '\s+', ' ').Trim(); if ($b.Length -gt 120) { $b = $b.Substring(0, 120) }
-        $v = $b; if ($b -match '(?i)version\s*:?\s*([\d\.]+)') { $v = "success - DSC Signer Service version : $($matches[1])" }
-        return @{ Pass = $true; Value = $v; Info = @("$($Cfg.IsLiveUrl) -> HTTP 200: $b") }
-    }
-    $kind = 'down'
-    if ($res.Ok) { $info += "isLive answered but version is not $($Cfg.DssVersion): $($res.Body)"; $kind = 'version' }
-    else {
-        $lenient = [DssfHttp]::Get($Cfg.IsLiveUrl, $false, 8000)
-        if ($lenient.Ok -and $lenient.Body -match [regex]::Escape($Cfg.DssVersion)) {
-            # working - browsers only show "Not Secure"; that is accepted (not an error), just reported
-            $b = ($lenient.Body -replace '\s+', ' ').Trim(); $v = $b; if ($b -match '(?i)version\s*:?\s*([\d\.]+)') { $v = "success - DSC Signer Service version : $($matches[1])" }
-            $why = Get-CertReason $lenient.CertRaw $res.SslErrors
-            $script:NotSecure = $why
-            return @{ Pass = $true; NotSecure = $true; Value = "$v  - running with 'Not Secure'"
-                      Info = @("$($Cfg.IsLiveUrl) -> HTTP 200: $b", "Running with 'Not Secure': $why. This is accepted - the browser shows 'Not secure' but the service works.") }
+    $response = Invoke-IsLive
+    if ($response.Ok -and (Test-DscLiveResponse $response.Body)) {
+        $text = "success. DSC Signer Service version : $($Cfg.DssVersion)"
+        if ($response.ExpiredAccepted) {
+            return @{ Pass=$true; Warn=$true; Fixable=$false; ExpiredAccepted=$true; CertificateTrusted=$false; Value="$text - expired certificate alert ignored for signer only"
+                Info=@($text,'Certificate expiry is a non-blocking warning for this signer endpoint. Use the browser exception action where offered. Other trust errors remain failures.') }
         }
-        if ($lenient.Ok) { $info += "isLive answers with another version: $($lenient.Body)"; $kind = 'version' }
-        else { $info += "isLive not reachable: $($res.Kind) $($res.Error)" }
+        return @{ Pass=$true; CertificateTrusted=$true; Value=$text; Info=@($text,'HTTPS certificate trusted.') }
     }
-    $adv = "Start 'Digital Signer Service' with right-click > Run as administrator, wait 30 seconds, then open $($Cfg.IsLiveUrl)."
-    if ($kind -eq 'cert') { $adv = "The service is running, but Windows does not trust its HTTPS certificate. Re-install DigitalSignerService 4.1.8 (it installs its certificate) or ask the eOffice/NIC helpdesk for the current signer root certificate." }
-    if ($kind -eq 'version') { $adv = "A different Signer Service version answers on port $($Cfg.Port). Uninstall it from Control Panel and run this tool again." }
-    return @{ Pass = $false; Info = $info; Kind = $kind; Procs = $procs; Advice = $adv }
+    $kind='down';$information=@()
+    if ($response.Ok) { $kind='version';$information += 'The expected success response for DSS 4.1.8 was not received.' }
+    elseif ($response.Kind -match 'TrustFailure|SecureChannelFailure' -or ($response.SslErrors -and $response.SslErrors -ne 'None')) { $kind='cert';$information += Get-CertReason $response.CertRaw $response.SslErrors }
+    else { $information += "isLive not reachable: $($response.Kind) $($response.Error)" }
+    return @{Pass=$false;Kind=$kind;Info=$information;FailValue=$information[0];Procs=@();Advice='Continue the ordered diagnostics. Only a date-expiry-only alert for the signer endpoint is accepted; other certificate errors need review.'}
 }
 function Stop-Dss($r) {
     $ps = @(Get-DssProcesses)
@@ -1402,7 +1460,7 @@ function Start-DssAdmin($r) {
     $deadline = (Get-Date).AddSeconds([int]$Cfg.StartWaitSeconds)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 2
-        $x = [DssfHttp]::Get($Cfg.IsLiveUrl, $false, 3000)
+        $x = [DssfHttpV3]::Get($Cfg.IsLiveUrl, $false, 3000)
         if ($x.Ok) { return $true }
     }
     Add-Action $r "Service did not answer within $($Cfg.StartWaitSeconds) s"
@@ -1441,7 +1499,7 @@ function Repair-IsLive($r, $t) {
     if (-not (Test-CaTrusted)) { Install-CaCert $r }
     Set-DssRunAsAdmin $r
     $chk = Invoke-IsLive
-    if ($chk.Ok -and $chk.Body -match [regex]::Escape($Cfg.DssVersion)) { return }
+    if ($chk.Ok -and (Test-DscLiveResponse $chk.Body)) { return }
     if ($t.Kind -eq 'version') { Repair-DssInstall $r -ForceRepair }
     if (@(Get-DssProcesses).Count) { Stop-Dss $r }
     # port must be free for the service itself
@@ -1522,66 +1580,63 @@ function Find-Browser([string]$Name) {
 
 # Real browser test: Chrome / Edge opened invisibly (own temporary profile) on the isLive URL
 function Invoke-HeadlessCheck($b) {
-    # opens the isLive page invisibly with a throw-away profile; 'Not Secure' certificates are accepted
-    $tag = $b.Name + '-' + (Get-Date -Format 'HHmmss')
-    $prof = Join-Path $RunDir "browser-$tag"; New-Item -ItemType Directory -Force $prof | Out-Null
-    $out = Join-Path $RunDir "browser-$tag.html"; $err = "$out.err"
-    $al = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--ignore-certificate-errors',
-            "--user-data-dir=`"$prof`"", '--virtual-time-budget=6000', '--dump-dom', $Cfg.IsLiveUrl)
-    if ($IsAdmin) { $al = @('--no-sandbox') + $al }
-    Log "HEADLESS $($b.Exe) $($al -join ' ')"
-    $res = @{ Html = ''; Err = '' }
+    $profile=Join-Path $RunDir ('browser-'+[guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($profile)
+    $arguments=@('--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check','--disable-extensions',"--user-data-dir=`"$profile`"",'--virtual-time-budget=6000','--dump-dom',$Cfg.IsLiveUrl)
+    $result=@{Html='';Err='';ExitCode=$null;Inconclusive=$false}
+    $process=$null
     try {
-        $p = Start-Process -FilePath $b.Exe -ArgumentList $al -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
-        if (-not (Wait-Proc $p 45000)) { try { $p.Kill() } catch { Write-DscError $_ 'Caught exception';} }
-    } catch { Write-DscError $_ 'Caught exception'; Log "headless failed: $_"; $res.Err = "$($_.Exception.Message)" }
-    Start-Sleep -Milliseconds 500
-    if (Test-Path $out) { $res.Html = [string](Get-Content $out -Raw) }
-    if (Test-Path $err) { $res.Err += [string](Get-Content $err -Raw) }
-    Log "HEADLESS result: $($res.Html.Length) chars, err: $($res.Err)"
-    Remove-Item -LiteralPath $prof -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
-    return $res
+        $info=New-Object Diagnostics.ProcessStartInfo
+        $info.FileName=$b.Exe;$info.Arguments=$arguments -join ' ';$info.UseShellExecute=$false;$info.CreateNoWindow=$true
+        $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+        $process=New-Object Diagnostics.Process;$process.StartInfo=$info
+        [void]$process.Start()
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+        if(-not (Wait-Proc $process 20000)){try{$process.Kill()}catch{};$result.Err='Browser probe timed out.';$result.Inconclusive=$true}
+        elseif([Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),3000)){
+            $result.Html=$stdout.Result;$result.Err=$stderr.Result;$result.ExitCode=$process.ExitCode
+        }else{$result.Err='Browser output did not close.';$result.Inconclusive=$true}
+        if(-not $result.Html -and -not $result.Err){$result.Inconclusive=$true}
+    }catch{Write-DscError $_ 'Browser diagnostic';$result.Err=$_.Exception.Message;$result.Inconclusive=$true}
+    finally{
+        if($process){$process.Dispose()}
+        $parent=[IO.Path]::GetFullPath($RunDir).TrimEnd('\')+'\'
+        $target=[IO.Path]::GetFullPath($profile)
+        if($target.StartsWith($parent,[StringComparison]::OrdinalIgnoreCase)) {Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue}
+    }
+    Log "HEADLESS $($b.Name): exit=$($result.ExitCode); chars=$($result.Html.Length); inconclusive=$($result.Inconclusive); $($result.Err)"
+    return $result
 }
 
 function Test-NotSecure {
     if ($null -eq $script:NotSecureChecked) {
-        $s1 = [DssfHttp]::Get($Cfg.IsLiveUrl, (-not $TestMode), 5000)
+        $s1 = [DssfHttpV3]::Get($Cfg.IsLiveUrl, (-not $TestMode), 5000)
         $script:NotSecureChecked = $true
-        if ($TestMode) { $script:NotSecureFlag = ($s1.Ok -and -not (Test-CertChainMock $s1.CertRaw)) } else { $script:NotSecureFlag = (-not $s1.Ok -and ([DssfHttp]::Get($Cfg.IsLiveUrl, $false, 5000)).Ok) }
+        if ($TestMode) { $script:NotSecureFlag = ($s1.Ok -and -not (Test-CertChainMock $s1.CertRaw)) } else { $script:NotSecureFlag = (-not $s1.Ok -and ([DssfHttpV3]::Get($Cfg.IsLiveUrl, $false, 5000)).Ok) }
     }
     return $script:NotSecureFlag
 }
 function Test-ChromiumBrowser([string]$Name) {
-    $b = Find-Browser $Name
-    if (-not $b) { return @{ Pass = $true; NA = $true; Value = 'not installed'; Info = @("$Name is not installed") } }
-    $info = @(); $kind = @()
-    $hl = Invoke-HeadlessCheck $b; $txt = $hl.Html
-    $ok = ($txt -match [regex]::Escape($Cfg.DssVersion))
-    if ($ok) { $info += "$Name $($b.Version) opened $($Cfg.IsLiveUrl) -> shows success (DSS $($Cfg.DssVersion))" }
-    else {
-        $code = 'NO_RESPONSE'; if ("$txt $($hl.Err)" -match '(ERR_[A-Z_]+)') { $code = $matches[1] }
-        $info += "$Name $($b.Version) cannot show isLive success ($code)"
-        if ($code -match 'CERT|SSL') { $kind += 'cert' }
-        elseif ($code -match 'PROXY|TUNNEL') { $kind += 'proxy' }
-        elseif ($code -match 'NAME_NOT_RESOLVED|ADDRESS_INVALID|ADDRESS_UNREACHABLE') { $kind += 'hosts' }
-        else { $kind += 'service' }
-        $px = Get-ProxyInfo
-        if ($px.Enable -eq 1 -and $px.Override -notmatch [regex]::Escape($Cfg.SignerHost)) { $info += "Windows proxy $($px.Server) is ON without a bypass for $($Cfg.SignerHost)"; $kind += 'proxy' }
-        if ($px.Pac) { $info += "Proxy script (PAC) in use: $($px.Pac) - it must send $($Cfg.SignerHost) DIRECT" }
+    $browser=Find-Browser $Name
+    if(-not $browser){return @{Pass=$true;NA=$true;Value='not installed';Info=@("$Name not installed.")}}
+    $probe=Invoke-HeadlessCheck $browser
+    $combined="$($probe.Html) $($probe.Err)"
+    $code='';if($combined -match '(ERR_[A-Z_]+)'){$code=$matches[1]}
+    $live=$ByNo[4].Last
+    if($code -eq 'ERR_CERT_DATE_INVALID' -and $live.Pass -and $live.ExpiredAccepted){
+        return @{Pass=$true;Warn=$true;Fixable=$false;Browser=$browser;Kind=@();Value="$Name - accepted signer expiry warning";Info=@('isLive success is confirmed. The fresh browser profile requires the approved signer expiry exception.');Advice='Use Browser exception help if the browser offers Advanced/Proceed.'}
     }
-    $vals = @(Get-LnaValues $Name); $miss = @($Cfg.LnaAllowedOrigins | Where-Object { $vals -notcontains $_ })
-    if ($miss.Count) { $info += "eOffice web pages are not yet allowed to contact the local signer (Local Network Access policy)"; $kind += 'lna' }
-    $kind = @($kind | Select-Object -Unique)
-    $val = ''; if ($ok) { $val = "$Name $($b.Version) - isLive success"; if (Test-NotSecure) { $val += "  - running with 'Not Secure'" } }
-    $warnOnly = $false
-    if ($ok -and $kind.Count -eq 1 -and $kind[0] -eq 'lna') { $warnOnly = $true; $val += '  (eOffice pages not yet allowed to reach it)' }
-    if (-not $ok -and ($kind -contains 'cert') -and ([DssfHttp]::Get($Cfg.IsLiveUrl, $false, 5000)).Ok) {
-        return @{ Pass = $true; Info = $info + "Accepted: page opens with 'Not Secure'"; Browser = $b; Value = "$Name $($b.Version) - isLive success  - running with 'Not Secure'" }
+    if($probe.Inconclusive -or (-not $probe.Html -and -not $code)){
+        return @{Pass=$true;Warn=$true;Fixable=$false;Browser=$browser;Kind=@();BrowserVerified=$false;Value="$Name - browser probe not verified";Info=@('The automated browser probe returned no usable page. This does not establish a browser or Signer Service failure.',$probe.Err);Advice='Inspect the isLive page in the already-open browser. No automatic repair is proposed for an inconclusive probe.'}
     }
-    if ($warnOnly) { return @{ Pass = $true; Warn = $true; Fixable = $true; Info = $info; Kind = $kind; Browser = $b; Value = $val; Advice = 'Fix installs the eOffice root certificate / browser policy.' } }
-    return @{ Pass = ($ok -and -not $kind.Count); Info = $info; Kind = $kind; Browser = $b; Value = $val
-              Advice = "Open $($Cfg.IsLiveUrl) in $Name. If it shows a warning or error, send a screenshot to IT." }
+    $ok=(Test-DscLiveResponse $probe.Html) -and $code -notmatch '^ERR_CERT_|^ERR_SSL_'
+    if(-not $ok){
+        $kind='service';if($code -match 'CERT|SSL'){$kind='cert'}elseif($code -match 'PROXY|TUNNEL'){$kind='proxy'}elseif($code -match 'NAME_NOT_RESOLVED|ADDRESS'){$kind='hosts'}
+        return @{Pass=$false;Browser=$browser;Kind=@($kind);Value="$Name - browser check failed $code";Info=@("Browser did not return expected isLive content: $code",$probe.Err);Advice='Review this browser-specific issue; see the independent isLive result.'}
+    }
+    $allowed=@(Get-LnaValues $Name);$missing=@($Cfg.LnaAllowedOrigins | Where-Object {$allowed -notcontains $_})
+    if($missing.Count){return @{Pass=$true;Warn=$true;Fixable=$true;Browser=$browser;Kind=@('lna');BrowserVerified=$true;Value="$Name - isLive success; eOffice access policy needs review";Info=@('Browser isLive success verified. eOffice Local Network Access policy is not configured.')}}
+    return @{Pass=$true;Browser=$browser;Kind=@();BrowserVerified=$true;Value="$Name - isLive success";Info=@('Browser page verified with normal certificate validation.')}
 }
 function Repair-ChromiumBrowser($r, $t, [string]$Name) {
     foreach ($k in $t.Kind) {
@@ -1632,12 +1687,7 @@ function Test-Firefox {
     if (-not $live.Pass) { $info += 'Signer Service isLive is not answering correctly'; $kind += 'service' }
     if (-not $kind.Count) { $info += "Firefox $($b.Version): certificate trust and proxy settings OK, isLive answering" }
     $val = ''; if (-not $kind.Count) { $val = "Firefox $($b.Version) - settings OK" }
-    if ($kind.Count -and -not ($kind | Where-Object { $_ -notin 'roots', 'ca' })) {
-        return @{ Pass = $true; Info = $info + "Accepted: page opens with 'Not Secure'"; Kind = @(); Browser = $b; Prefs = $manualNoBypass
-                  Value = "Firefox $($b.Version) - isLive answering  - running with 'Not Secure'" }
-    }
-    if (-not $kind.Count -and (Test-NotSecure)) { $val += "  - running with 'Not Secure'" }
-    return @{ Pass = ($kind.Count -eq 0); Info = $info; Kind = $kind; Browser = $b; Value = $val; Prefs = $manualNoBypass
+    return @{ Pass = ($kind.Count -eq 0); Warn = [bool]$live.ExpiredAccepted; Fixable = $false; Info = $info; Kind = $kind; Browser = $b; Value = $val; Prefs = $manualNoBypass
               Advice = 'In Firefox: Settings > Privacy & Security > Certificates > View Certificates > Authorities > Import eOfficeCA2022.cer, then open the isLive link.' }
 }
 function Repair-Firefox($r, $t) {
@@ -1741,16 +1791,16 @@ function Write-Report {
     $failed = @($all | Where-Object { $_.Status -eq 'FAIL' -or $_.Status -eq 'SKIP' }).Count
     $fixed = @($all | Where-Object { $_.Status -eq 'FIXED' }).Count
     $warns = @($all | Where-Object { $_.Status -eq 'WARN' }).Count
-    if ($failed -eq 0 -and $warns) { $banner = 'WORKING, WITH WARNING(S)'; $bcls = 'wn'; $bsub = "isLive works. $warns warning(s): see the amber cards (usually the certificate is not trusted, so browsers show 'Not secure')." }
-    elseif ($failed -eq 0) { $banner = 'ALL TESTS OK'; $bcls = 'ok'; $bsub = $(if ($fixed) { "$fixed problem(s) were found and fixed with your permission. DSC signing is ready." } else { 'Everything was already correct. DSC signing is ready.' }) }
-    else { $banner = "$failed CHECK(S) NEED ATTENTION"; $bcls = 'bad'; $bsub = 'See the red cards below for what to do, then double-click the tool again.' }
+    $state=Get-DscOverallState
+    $banner=$state.Title; $bsub=$state.Detail
+    $bcls=$(if($state.Working){'ok'}elseif(-not $state.Verified){'wn'}else{'bad'})
     $cards = ''; $rows = ''
-    foreach ($r in ($all | Sort-Object No)) {
+    foreach ($r in $all) {
         switch ($r.Status) { 'OK' { $pill = 'TEST OK'; $c = 'ok' } 'FIXED' { $pill = 'FIXED &#183; TEST OK'; $c = 'fixed' } 'WARN' { $pill = 'TEST OK &#183; NOTE'; $c = 'warn' } 'NA' { $pill = 'NOT INSTALLED'; $c = 'na' } 'NOTRUN' { $pill = 'NOT NEEDED'; $c = 'na' } 'PENDING' { $pill = 'NOT TESTED'; $c = 'na' } 'SKIP' { $pill = 'NOT FIXED (skipped)'; $c = 'bad' } default { $pill = 'FAILED'; $c = 'bad' } }
         $det = ($r.Detail | ForEach-Object { "<li>$(ConvertTo-Html5 $_)</li>" }) -join ''
         $act = ''; if ($r.Actions.Count) { $act = '<div class="lbl">What the tool did</div><ul class="act">' + (($r.Actions | ForEach-Object { "<li>$(ConvertTo-Html5 $_)</li>" }) -join '') + '</ul>' }
         $adv = ''; if ($r.Status -eq 'FAIL' -and $r.Advice) { $adv = "<div class='adv'><b>Do this:</b> $(ConvertTo-Html5 $r.Advice)</div>" }
-        $rows += "<tr><td>$($r.No)</td><td>$(ConvertTo-Html5 $r.Title)</td><td class='s-$(($r.Before).ToLower())'>$(Get-Label $r.Before)</td><td class='s-$(($r.Status).ToLower())'>$(Get-Label $r.Status)</td><td>$(ConvertTo-Html5 $r.Value)</td></tr>"
+        $rows += "<tr><td>$($r.DisplayNo)</td><td>$(ConvertTo-Html5 $r.Title)</td><td class='s-$(($r.Before).ToLower())'>$(Get-Label $r.Before)</td><td class='s-$(($r.Status).ToLower())'>$(Get-Label $r.Status)</td><td>$(ConvertTo-Html5 $r.Value)</td></tr>"
         $cards += "<section class='card $c'><div class='head'><span class='no'>$($r.No)</span><h2>$(ConvertTo-Html5 $r.Title)</h2><span class='pill'>$pill</span></div><ul class='det'>$det</ul>$act$adv</section>`n"
     }
     $machine = ConvertTo-Html5 ("{0}  |  {1}  |  {2}" -f [Environment]::MachineName, [Environment]::UserName, (Get-Date -Format 'dd-MMM-yyyy HH:mm'))
@@ -1796,7 +1846,7 @@ $cards
 </div><script>
 function chk(){var e=document.getElementById('lv');e.textContent='checking\u2026';e.style.color='';
 var x=new XMLHttpRequest();try{x.open('GET','$url?t='+Date.now(),true);}catch(err){e.textContent='Browser blocked the request';return;}
-x.timeout=8000;x.onload=function(){var ok=x.status==200&&x.responseText.indexOf('$ver')>-1;e.textContent=(ok?'TEST OK \u2014 ':'Unexpected answer \u2014 ')+x.responseText.substring(0,120);e.style.color=ok?'var(--ok)':'var(--bd)';};
+x.timeout=8000;x.onload=function(){var ok=x.status==200&&/\bsuccess\b/i.test(x.responseText)&&x.responseText.indexOf('$ver')>-1;e.textContent=(ok?'TEST OK \u2014 ':'Unexpected answer \u2014 ')+x.responseText.substring(0,120);e.style.color=ok?'var(--ok)':'var(--bd)';};
 x.onerror=x.ontimeout=function(){e.innerHTML='This page could not test it directly (browsers often block local checks from a saved file). Click <a href="$url" target="_blank">open in new tab</a> &#8212; it must show <b>$ver</b>. A certificate warning there means: run the tool again.';e.style.color='var(--wn)';};x.send();}
 chk();</script></body></html>
 "@
@@ -1809,22 +1859,108 @@ chk();</script></body></html>
 # =====================================================================
 Log "Tool: $SelfPath   RunDir: $RunDir   Mode: $Mode"
 
+function Update-JavaOffer {
+    $script:JavaUpdateOffer = @{ Available = $false; Current = 0; Latest = 0; Text = 'Java update not required.' }
+    if ($script:UiJavaOffer) { & $script:UiJavaOffer }
+    if ($Results['1'].Status -notin 'OK','FIXED' -or $Results['7'].Status -notin 'OK','FIXED') { return }
+    $best = Get-InstalledJava | Where-Object { $_.Major -eq 8 -and $_.Is64 } | Sort-Object Update -Descending | Select-Object -First 1
+    if (-not $best) { return }
+    $latest = Get-JavaLatest
+    $script:JavaUpdateOffer.Current = $best.Update
+    $script:JavaUpdateOffer.Latest = $latest.Update
+    if ($latest.Update -gt $best.Update) {
+        $script:JavaUpdateOffer.Available = $true
+        $script:JavaUpdateOffer.Text = "Optional Java update: $($best.Update) -> $($latest.Update). Working Java is kept unless you choose Update Java."
+        Say $script:JavaUpdateOffer.Text 'Yellow'
+    } elseif (-not $latest.Update) { $script:JavaUpdateOffer.Text = 'Java update availability could not be checked. Existing working Java is kept.' }
+    Write-DscEvent 'Info' 'Optional Java update checked' $script:JavaUpdateOffer
+    if ($script:UiJavaOffer) { & $script:UiJavaOffer }
+}
+
+function Invoke-OptionalJavaUpdate([switch]$Confirmed) {
+    if (-not $Confirmed -or -not $script:JavaUpdateOffer.Available) { return $false }
+    if (-not $IsAdmin) { Say 'Open an Administrator PowerShell session, run this tool again and choose Update Java.' 'Yellow'; return $false }
+    Write-DscEvent 'Info' 'Optional Java update selected' @{}
+    Install-JavaLatest $ByNo[1].R
+    $script:JavaLatest = $null
+    return $true
+}
+
+function Prepare-DscInstaller {
+    if ($Results['3'].Status -notin 'FAIL','SKIP') { return $false }
+    if ($CheckOnly) { Add-Detail $Results['3'] 'Installer download/preparation deferred in check-only mode.'; return $false }
+    try {
+        $source = Find-DssPackageSource
+        if (-not $source -and (-not $Cfg.AllowDssDownload -or -not $Cfg.PackageUrl)) {
+            Add-Detail $Results['3'] 'Local-package edition: select an approved local 4.1.8 ZIP/MSI/folder. No DSS download was attempted.'
+            return $false
+        }
+        $msi = Get-DssPackageMsi
+        if (-not $msi) { Add-Detail $Results['3'] 'No usable installer is ready; use Locate installer.'; return $false }
+        $validation = Test-PackageValid $msi
+        if (-not $validation.Ok) { throw ('Installer rejected: ' + $validation.Text) }
+        $script:PkgMsi = $msi
+        Add-Detail $Results['3'] ('Installer automatically validated: ' + $msi + '. Installation still requires selecting a repair.')
+        Write-DscEvent 'Info' 'Installer validated' @{ Path = $msi }
+        return $true
+    } catch { Write-DscError $_ 'Installer preparation'; Add-Detail $Results['3'] ('Installer preparation failed: ' + $_.Exception.Message); return $false }
+}
+
+function Show-SignerCertificateHelp([switch]$UseGui) {
+    $url = 'https://eoffsigner.eoffice.gov.in:55101/check/isLive'
+    $text = "For this signer address only: $url`r`nIf the browser offers Advanced, choose Proceed or Add Exception for this address. This is the pre-approved signer exception.`r`nIf the browser does not offer that action, follow your IT administrator's instructions. No global browser certificate policy is changed."
+    if ($UseGui) {
+        Start-Process -FilePath $url -ErrorAction Stop
+        [void][Windows.Forms.MessageBox]::Show($text, 'Signer certificate exception', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information)
+    } else { Say $text 'Yellow' }
+}
+
+function Get-DscOverallState {
+    $live=$Results['4'];$definition=$ByNo[4]
+    $failures=@($Defs | Where-Object {$_.No -ne 4 -and $_.R.Status -in 'FAIL','SKIP'}).Count
+    $warnings=@($Defs | Where-Object {$_.R.Status -eq 'WARN'}).Count
+    if (-not $definition.Tested -or $definition.Last.DiagnosticError -or $definition.Last.Inconclusive) {
+        return @{Working=$false;Verified=$false;Title='isLive NOT VERIFIED';Detail='The isLive diagnostic did not complete. See the diagnostic log.';Failures=$failures;Warnings=$warnings}
+    }
+    if ($live.Status -in 'OK','FIXED','WARN') {
+        $detail="isLive success. $failures additional check(s) need attention; $warnings warning(s)."
+        if($definition.Last.ExpiredAccepted){$detail+=' The signer expiry alert is accepted.'}
+        return @{Working=$true;Verified=$true;Title=$(if($failures -or $warnings){'WORKING - WITH NOTICES'}else{'WORKING'});Detail=$detail;Failures=$failures;Warnings=$warnings}
+    }
+    return @{Working=$false;Verified=$true;Title='isLive NOT WORKING';Detail='The isLive request did not return the required success response. Review the results below.';Failures=$failures;Warnings=$warnings}
+}
+
+function Invoke-JavaVersion([string]$File) {
+    # Java writes its successful -version output to stderr. Read it as text, not a PowerShell error.
+    $info=New-Object Diagnostics.ProcessStartInfo
+    $info.FileName=$File;$info.Arguments='-version';$info.UseShellExecute=$false;$info.CreateNoWindow=$true
+    $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+    $process=New-Object Diagnostics.Process;$process.StartInfo=$info
+    try {
+        [void]$process.Start()
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+        if(-not (Wait-Proc $process 15000)){try{$process.Kill()}catch{};return @{Code=-1;Text='Java version probe timed out.'}}
+        if(-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),3000)){return @{Code=-1;Text='Java output did not close.'}}
+        return @{Code=$process.ExitCode;Text=($stdout.Result+' '+$stderr.Result).Trim()}
+    } finally {$process.Dispose()}
+}
+
 $Defs = @(
-    @{ No = 1;  Title = 'Latest Java Runtime installed';                     T = { Test-JavaLatest };  F = { param($r, $t) Install-JavaLatest $r };       Plan = 'Download the latest Java (64-bit) from java.com, check its Oracle signature, install silently' },
-    @{ No = 2;  Title = "Port $($Cfg.Port) not occupied by other software";  T = { Test-Port };        F = { param($r, $t) Repair-Port $r $t };         Plan = "Close the program holding port $($Cfg.Port) / free the Windows-reserved port" },
-    @{ No = 3;  Title = "DigitalSignerService $($Cfg.DssVersion) installed properly"; T = { Test-DssInstall }; F = { param($r, $t) Repair-DssInstall $r $t }; Plan = "Remove old Signer Service, install $($Cfg.DssVersion) silently (built-in / chosen / nearby installer)" },
     @{ No = 4;  Title = 'Signer Service running, isLive success';   T = { Test-IsLive };      F = { param($r, $t) Repair-IsLive $r $t };       Plan = 'Install eOffice root certificate, start Signer Service as administrator, auto-start at logon' },
+    @{ No = 3;  Title = "DigitalSignerService $($Cfg.DssVersion) installed properly"; T = { Test-DssInstall }; F = { param($r, $t) Repair-DssInstall $r $t }; Plan = "Remove old Signer Service, install $($Cfg.DssVersion) silently (built-in / chosen / nearby installer)" },
     @{ No = 5;  Title = 'Clean PATH: no stale Java / JAVA_TOOL_OPTIONS';     T = { Test-EnvVars };     F = { param($r, $t) Repair-EnvVars $r $t };      Plan = 'Remove stale Java PATH entries, bad JAVA_HOME, JAVA_TOOL_OPTIONS; restore missing Windows PATH folders (backup kept)' },
-    @{ No = 6;  Title = 'hosts: 127.0.0.1 eoffsigner.eoffice.gov.in';        T = { Test-Hosts };       F = { param($r, $t) Repair-Hosts $r };           Plan = 'Correct the hosts line to 127.0.0.1 eoffsigner.eoffice.gov.in (backup kept), flush DNS' },
     @{ No = 7;  Title = 'Java works properly';                               T = { Test-JavaWorks };   F = { param($r, $t) Repair-JavaWorks $r $t };    Plan = 'Put the latest Java first on PATH / reinstall Java' },
+    @{ No = 1;  Title = 'Suitable Java Runtime installed';                     T = { Test-JavaLatest };  F = { param($r, $t) Install-JavaLatest $r };       Plan = 'Keep suitable installed Java; install suitable Java only when absent. Updating working Java is an optional separate action.' },
+    @{ No = 2;  Title = "Port $($Cfg.Port) not occupied by other software";  T = { Test-Port };        F = { param($r, $t) Repair-Port $r $t };         Plan = "Close the program holding port $($Cfg.Port) / free the Windows-reserved port" },
+    @{ No = 6;  Title = 'hosts: 127.0.0.1 eoffsigner.eoffice.gov.in';        T = { Test-Hosts };       F = { param($r, $t) Repair-Hosts $r };           Plan = 'Correct the hosts line to 127.0.0.1 eoffsigner.eoffice.gov.in (backup kept), flush DNS' },
     @{ No = 8;  Title = 'Chrome shows isLive success';                       T = { Test-ChromiumBrowser 'Chrome' }; F = { param($r, $t) Repair-ChromiumBrowser $r $t 'Chrome' }; Plan = 'Fix whatever blocks Chrome: certificate, proxy bypass, hosts, service; allow eOffice pages to reach the signer' },
     @{ No = 9;  Title = 'Edge shows isLive success';                         T = { Test-ChromiumBrowser 'Edge' };   F = { param($r, $t) Repair-ChromiumBrowser $r $t 'Edge' };   Plan = 'Fix whatever blocks Edge: certificate, proxy bypass, hosts, service; allow eOffice pages to reach the signer' },
     @{ No = 10; Title = 'Firefox can show isLive success';                   T = { Test-Firefox };     F = { param($r, $t) Repair-Firefox $r $t };      Plan = 'Make Firefox trust the Windows certificate store, add proxy exception, start service' }
 )
-$FixOrder = 6, 5, 1, 7, 2, 3, 4, 8, 9, 10
-$ByNo = @{}; foreach ($d in $Defs) { $d.R = New-Result $d.No $d.Title; $ByNo[$d.No] = $d }
+$FixOrder = 5, 7, 1, 2, 3, 6, 4, 8, 9, 10
+$ByNo = @{}; $displayNo = 0; foreach ($d in $Defs) { $displayNo++; $d.DisplayNo = $displayNo; $d.R = New-Result $d.No $d.Title; $d.R | Add-Member DisplayNo $displayNo; $ByNo[$d.No] = $d }
 # ---------------- engine shared by the window and the console
-$QuickNos = 4, 8, 9, 10            # overall test: isLive + the three browsers
+$QuickNos = @(4)                  # first gate: secure isLive success
 function Invoke-AllTests([int[]]$Nos) {
     $script:NotSecureChecked = $null; $script:NotSecure = $null
     foreach ($d in $Defs) {
@@ -1834,7 +1970,7 @@ function Invoke-AllTests([int[]]$Nos) {
         try { $t = & $d.T; if ($null -eq $t) { throw 'Diagnostic returned no result.' } }
         catch {
             Write-DscError $_ ("Diagnostic check " + $d.No)
-            $t = @{ Pass = $false; Info = @('Diagnostic raised an exception; see events.jsonl.'); Advice = 'Review the local error log before attempting this repair.' }
+            $t = @{ Pass = $false; DiagnosticError = $true; Info = @('Diagnostic raised an exception; see events.jsonl.'); Advice = 'Review the local error log before attempting this repair.' }
         }
         $d.Last = $t
         $prev = $d.R.Status
@@ -1858,7 +1994,7 @@ function Get-QuickVerdict {
     return 'OK'
 }
 function Set-NotNeeded {
-    foreach ($d in $Defs) { if (-not $d.Tested) { $d.R.Status = 'NOTRUN'; $d.R.Value = 'not needed - the overall test passed'; if ($script:UiRow) { & $script:UiRow $d } } }
+    foreach ($d in $Defs) { if (-not $d.Tested) { $d.R.Status = 'NOTRUN'; $d.R.Value = 'not needed - secure isLive success'; if ($script:UiRow) { & $script:UiRow $d } } }
 }
 function Invoke-Fixes([int[]]$nos) {
     foreach ($no in $FixOrder) {
@@ -1886,11 +2022,11 @@ function Request-Elevation([int[]]$nos, [string]$NextMode) {
     return $false
 }
 if ($script:Handoff -and $script:Handoff.pkg) { $script:PkgOverride = [string]$script:Handoff.pkg }
-if ($script:Handoff -and $script:Handoff.pkgurl -and -not $Cfg.PackageUrl) { $Cfg.PackageUrl = [string]$script:Handoff.pkgurl; $Cfg.PackageSha256 = [string]$script:Handoff.pkgsha }
+if ($Cfg.AllowDssDownload -and $script:Handoff -and $script:Handoff.pkgurl -and -not $Cfg.PackageUrl) { $Cfg.PackageUrl = [string]$script:Handoff.pkgurl; $Cfg.PackageSha256 = [string]$script:Handoff.pkgsha }
 function Save-Results {
     Save-DscSession $Results
     $rep = Write-Report
-    $Results.Values | Select-Object No, Title, Before, BeforeValue, Status, Value, @{n = 'Detail'; e = { $_.Detail -join ' | ' } }, @{n = 'Actions'; e = { $_.Actions -join ' | ' } }, Advice |
+    $Results.Values | Select-Object No, DisplayNo, Title, Before, BeforeValue, Status, Value, @{n = 'Detail'; e = { $_.Detail -join ' | ' } }, @{n = 'Actions'; e = { $_.Actions -join ' | ' } }, Advice |
         ConvertTo-Json | Set-Content (Join-Path $RunDir 'result.json')
     return $rep
 }
@@ -1903,7 +2039,7 @@ function Start-Pack {
 }
 
 # ---------------- CONSOLE mode
-# step 1 (console): where is the 4.1.8 installer? validate it, then ask to perform the check
+# step 2 (console): where is the 4.1.8 installer? validate it, then ask to perform the check
 function Select-PackageConsole([string]$Reason, [switch]$Start) {
     # same validation everywhere: start, 'locate', DSS not installed, installer needed during Fix
     if ($Reason) { Say ''; Say "   $Reason" 'Red' }
@@ -1926,10 +2062,10 @@ function Select-PackageConsole([string]$Reason, [switch]$Start) {
     }
 }
 $script:PkgAsked = $false
-# step 1: is DSS 4.1.8 at its standard path? only if NOT, ask for the installer package
+# step 2: is DSS 4.1.8 at its standard path? only if NOT, ask for the installer package
 function Request-PackageStart {
     $ver = $Cfg.DssVersion
-    Say ''; Say "STEP 1 - Is DigitalSignerService $ver installed?  ($($Cfg.DssExePaths[0]))" 'White'
+    Say ''; Say "STEP 2 - Is DigitalSignerService $ver installed?  ($($Cfg.DssExePaths[0]))" 'White'
     $t3 = Test-DssInstall
     if (-not $t3.NotInstalled) { Say "   FOUND - $($t3.Exe)" 'Green'; return $true }
     Say "   NOT INSTALLED in this system - $($Cfg.DssExePaths[0]) was not found." 'Red'
@@ -1951,7 +2087,7 @@ function Invoke-InstallerCheckConsole {
 
 function Show-Fixable($list) {
     foreach ($d in $list) {
-        Say ("   [{0}] {1}   ({2})" -f $d.No, $d.Title, (Get-Label $d.R.Status)) $(if ($d.R.Status -eq 'WARN') { 'Yellow' } else { 'Red' })
+        Say ("   [{0}] {1}   ({2})" -f $d.DisplayNo, $d.Title, (Get-Label $d.R.Status)) $(if ($d.R.Status -eq 'WARN') { 'Yellow' } else { 'Red' })
         foreach ($i in $d.Last.Info) { Say "        found : $i" 'Gray' }
         Say "        fix   : $($d.Plan)" 'Cyan'
     }
@@ -1963,42 +2099,8 @@ function Start-Console {
     Say "  Running as: $(if($IsAdmin){'Administrator'}else{'normal user (reopen PowerShell as Administrator for repairs)'})" 'Gray'
     Say '=================================================================' 'White'
     $handFix = @(); if ($script:Handoff) { $handFix = @($script:Handoff.fix | ForEach-Object { [int]$_ }) }
-    if (-not $handFix.Count -and -not $CheckOnly) {
-        if (-not (Request-PackageStart)) { Say 'Cancelled - nothing was checked or changed.' 'Yellow'; return }
-        Say ''; Say 'STEP 2 - Building the fix dashboard (tests only, nothing is changed) ...' 'White'
-    }
-    $verdict = 'FAIL'
-    if (-not $handFix.Count) {
-        Say ''; Say 'Overall test: isLive + Chrome / Edge / Firefox' 'White'; Say ''
-        Invoke-AllTests $QuickNos
-        foreach ($n in $QuickNos) { Show-Row $ByNo[$n].R }
-        $verdict = Get-QuickVerdict
-        Say ''
-        $full = $true
-        if ($verdict -eq 'OK') {
-            Say '   >>>  ALL OK - isLive works in your browsers. Nothing needs to be done.  <<<' 'Green'
-            if ($script:NotSecure) { Say "   Note: running with 'Not Secure' - $($script:NotSecure) (accepted, not an error)" 'Yellow' }
-            Say ''
-            $full = ($CheckOnly -or (Ask '   Run the full detailed check anyway?  [Y/N] : ' @('Y', 'N') 'N') -eq 'Y')
-            if (-not $full) { Set-NotNeeded }
-        } elseif ($verdict -eq 'WARN') {
-            Say '   >>>  WORKING, but with warning(s) - see the yellow lines above  <<<' 'Yellow'
-            Say ''
-            $full = ($CheckOnly -or (Ask '   Run the full detailed check as well?  [Y/N] : ' @('Y', 'N') 'N') -eq 'Y')
-            if (-not $full) { Set-NotNeeded }
-        } else {
-            Say '   >>>  NOT WORKING - running the full check to find the cause ...  <<<' 'Red'
-        }
-        if ($full) {
-            Say ''; Say 'Full check - FIX DASHBOARD  (nothing is changed)' 'White'; Say ''
-            Invoke-AllTests
-            foreach ($d in $Defs) { Show-Row $d.R }
-        }
-    } else {
-        Say ''; Say "Restarted with administrator rights to fix: $($handFix -join ', '). Testing again first ..." 'White'; Say ''
-        Invoke-AllTests
-        foreach ($d in $Defs) { Show-Row $d.R }
-    }
+    $ready = Invoke-StartupSequence -OpenBrowser:(-not $CheckOnly) -FullCheck:($CheckOnly -or $handFix.Count -gt 0)
+    foreach ($d in $Defs) { if ($d.Tested) { Show-Row $d.R } }
     # installer missing? offer to locate it right away
     if (-not $CheckOnly) { Invoke-InstallerCheckConsole }
     $fixable = @(Get-Fixable)
@@ -2011,9 +2113,9 @@ function Start-Console {
             $doFix = @($fixable | Where-Object { $handFix -contains $_.No } | ForEach-Object { $_.No })
             if ($doFix.Count -and (Ask "   Fix now: $($doFix -join ', ')?  [Y/N] : " @('Y', 'N') 'N') -ne 'Y') { $doFix = @() }
         } else {
-            $a = Ask '   STEP 3 - Run the fixes?  [Y] ALL   [S] Selected ones (asked one by one)   [N] Not now : ' @('Y', 'S', 'N') 'N'
+            $a = Ask '   STEP 9 - Run the fixes?  [Y] ALL   [S] Selected ones (asked one by one)   [N] Not now : ' @('Y', 'S', 'N') 'N'
             if ($a -eq 'Y') { $doFix = @($fixable | ForEach-Object { $_.No }) }
-            elseif ($a -eq 'S') { foreach ($d in $fixable) { if ((Ask ("   Fix [{0}] {1}?  [Y/N] : " -f $d.No, $d.Title) @('Y', 'N') 'N') -eq 'Y') { $doFix += $d.No } } }
+            elseif ($a -eq 'S') { foreach ($d in $fixable) { if ((Ask ("   Fix [{0}] {1}?  [Y/N] : " -f $d.DisplayNo, $d.Title) @('Y', 'N') 'N') -eq 'Y') { $doFix += $d.No } } }
         }
         foreach ($d in $fixable) { if ($doFix -notcontains $d.No -and $d.R.Status -eq 'FAIL') { $d.R.Status = 'SKIP'; $d.R.Advice = "Not fixed (you chose No). $($d.R.Advice)" } }
         if ($doFix.Count -and -not $IsAdmin) {
@@ -2027,15 +2129,15 @@ function Start-Console {
         Say ''; Say 'Fixing ...' 'White'
         Invoke-Fixes $doFix
         Say ''; Say 'Testing again ...' 'White'; Say ''
-        Invoke-AllTests
+        [void](Invoke-StartupSequence -FullCheck)
         foreach ($d in $Defs) { Show-Row $d.R }
     }
     $bad = @(Get-Failed).Count; $warn = @($Defs | Where-Object { $_.R.Status -eq 'WARN' }).Count
     Say ''
     if ($Results['4'].Status -in 'OK', 'FIXED', 'WARN') { Say "   isLive: $($Results['4'].Value)" $(if ($Results['4'].Status -eq 'WARN') { 'Yellow' } else { 'Green' }) }
-    if ($bad) { Say "   >>>  $bad check(s) FAILED - see the report  <<<" 'Red' }
-    elseif ($warn) { Say "   >>>  WORKING, $warn warning(s) left  <<<" 'Yellow' }
-    else { Say '   >>>  ALL TESTS OK  -  DSC signing is ready  <<<' 'Green' }
+    $state=Get-DscOverallState
+    Say ("   >>> " + $state.Title + " <<<") $(if($state.Working){'Green'}else{'Yellow'})
+    Say $state.Detail
     if (-not $CheckOnly -and $doFix.Count -and $Results['4'].Status -in 'OK', 'FIXED', 'WARN') {
         Say ''
         if ((Ask '   Open the isLive page in Chrome / Edge / Firefox so you can see "success"?  [Y/N] : ' @('Y', 'N') 'N') -eq 'Y') {
@@ -2046,12 +2148,19 @@ function Start-Console {
     $report = Save-Results
     Say ("Session logs: " + $script:DscSessionDirectory)
     if (-not $CheckOnly -and -not $TestMode) {
-        $reportChoice = Ask '   [E] Preview error report   [I] Suggest improvement   [N] Finish : ' @('E','I','N') 'N'
+        if ($script:JavaUpdateOffer.Available) { Say $script:JavaUpdateOffer.Text 'Yellow' }
+        $reportChoice = Ask '   [U] Optional Java update   [C] Browser exception help   [E] Error report   [I] Improvement   [N] Finish : ' @('U','C','E','I','N') 'N'
+        if ($reportChoice -eq 'C') { Show-SignerCertificateHelp }
+        if ($reportChoice -eq 'U' -and $script:JavaUpdateOffer.Available) {
+            if ((Ask '   Install the optional Java update? [Y/N] : ' @('Y','N') 'N') -eq 'Y') {
+                if (Invoke-OptionalJavaUpdate -Confirmed) { [void](Invoke-StartupSequence -FullCheck); $report = Save-Results }
+            }
+        }
         if ($reportChoice -eq 'E') { Show-DscGitHubReport }
         elseif ($reportChoice -eq 'I') { Show-DscGitHubReport -Kind Improvement }
     }
     Say ''; Say "Report: $report"
-    if ($Cfg.OpenReport -and -not $TestMode -and ($bad -or $doFix.Count)) { Start-Process $report }
+    if ($Cfg.OpenReport -and -not $TestMode -and -not $CheckOnly -and ($bad -or $doFix.Count)) { Start-Process $report }
 }
 
 # ---------------- WINDOW (visual) mode
@@ -2100,7 +2209,7 @@ function Start-Gui {
     $t1 = New-Object Windows.Forms.Label; $t1.UseMnemonic = $false; $t1.Text = 'DSC Signer Service - Check & Fix'; $t1.ForeColor = [Drawing.Color]::White
     $t1.Font = (New-UiFont 'Segoe UI Semibold' 15); $t1.AutoSize = $true; $t1.Location = New-Object Drawing.Point(16, 8)
     $t2 = New-Object Windows.Forms.Label; $t2.ForeColor = [Drawing.Color]::FromArgb(200, 220, 235); $t2.AutoSize = $true; $t2.Location = New-Object Drawing.Point(18, 44)
-    $t2.Text = "Overall test (isLive + Chrome / Edge / Firefox) - nothing is changed   |   $([Environment]::MachineName)   |   $(if ($IsAdmin) { 'Administrator' } else { 'normal user' })"
+    $t2.Text = "isLive, installation path, PATH, Java, port, installer preparation and remaining checks   |   $([Environment]::MachineName)   |   $(if ($IsAdmin) { 'Administrator' } else { 'normal user' })"
     $hdr.Controls.AddRange(@($t1, $t2)); $G.Sub = $t2
 
     # isLive banner
@@ -2115,6 +2224,22 @@ function Start-Gui {
     $G.BGitHub = New-Btn 'Report error ...' 130
     $G.BImprove = New-Btn 'Suggest improvement ...' 165
     $bar.Controls.AddRange(@($G.BGitHub, $G.BImprove))
+    $G.BJavaUpdate = New-Btn 'Update Java (optional)' 165
+    $G.BJavaUpdate.Visible = $false
+    $G.BCertificate = New-Btn 'Browser exception ...' 150
+    $G.BCertificate.Visible = $false
+    $bar.Controls.AddRange(@($G.BJavaUpdate, $G.BCertificate))
+    $G.JavaTimer = New-Object Windows.Forms.Timer; $G.JavaTimer.Interval = 600
+    $G.JavaTimer.Add_Tick({
+        if ($script:G.BJavaUpdate.BackColor -eq [Drawing.Color]::Yellow) { $script:G.BJavaUpdate.BackColor = [Drawing.Color]::Orange }
+        else { $script:G.BJavaUpdate.BackColor = [Drawing.Color]::Yellow }
+    })
+    $script:UiJavaOffer = {
+        if ($script:G.Form.IsDisposed) { return }
+        $script:G.BJavaUpdate.Visible = [bool]$script:JavaUpdateOffer.Available
+        if ($script:JavaUpdateOffer.Available) { $script:G.JavaTimer.Start() } else { $script:G.JavaTimer.Stop() }
+        [Windows.Forms.Application]::DoEvents()
+    }
     $G.BTest = New-Btn 'Run full check' 115
     $G.BFix = New-Btn 'Fix selected ...' 130
     $G.BLocate = New-Btn 'Locate installer ...' 145
@@ -2149,12 +2274,12 @@ function Start-Gui {
     $split = New-Object Windows.Forms.SplitContainer; $split.Dock = 'Fill'; $split.Orientation = 'Horizontal'
     $lv = New-Object Windows.Forms.ListView; $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.CheckBoxes = $true
     $lv.HideSelection = $false; $lv.Font = (New-UiFont 'Segoe UI' 10); $lv.HeaderStyle = 'Nonclickable'
-    [void]$lv.Columns.Add('Fix  #', 62); [void]$lv.Columns.Add('Check', 360); [void]$lv.Columns.Add('Status', 110); [void]$lv.Columns.Add('State / version', 520)
-    $G.List = $lv
+    [void]$lv.Columns.Add('Check #', 78); [void]$lv.Columns.Add('Check', 360); [void]$lv.Columns.Add('Status', 110); [void]$lv.Columns.Add('State / version', 520)
+    $G.List = $lv; $G.RowsById = @{}
     foreach ($d in $Defs) {
-        $it = New-Object Windows.Forms.ListViewItem("$($d.No)"); $it.UseItemStyleForSubItems = $false; $it.Tag = $d.No
+        $it = New-Object Windows.Forms.ListViewItem("$($lv.Items.Count + 1)"); $it.UseItemStyleForSubItems = $false; $it.Tag = $d.No
         [void]$it.SubItems.Add($d.Title); [void]$it.SubItems.Add('...'); [void]$it.SubItems.Add('')
-        [void]$lv.Items.Add($it)
+        [void]$lv.Items.Add($it); $G.RowsById[[int]$d.No] = $it
     }
     $txt = New-Object Windows.Forms.TextBox; $txt.Dock = 'Fill'; $txt.Multiline = $true; $txt.ReadOnly = $true; $txt.ScrollBars = 'Vertical'
     $txt.Font = (New-UiFont 'Consolas' 9.5); $txt.BackColor = [Drawing.Color]::FromArgb(250, 251, 252); $G.Txt = $txt
@@ -2173,7 +2298,7 @@ function Start-Gui {
     }
     $script:UiRowInner = {
         param($d)
-        $C = $script:GC; $it = $script:G.List.Items[[int]$d.No - 1]
+        $C = $script:GC; $it = $script:G.RowsById[[int]$d.No]
         $st = $d.R.Status; $lab = Get-Label $st
         $it.SubItems[2].Text = $lab; $it.SubItems[3].Text = $d.R.Value
         $col = $C.Ok; $bg = [Drawing.Color]::White
@@ -2196,7 +2321,7 @@ function Start-Gui {
         } catch { Write-DscError $_ 'Caught exception';}
     }
     function Set-Busy([bool]$b) {
-        foreach ($k in 'BTest', 'BFix', 'BLocate', 'BOpen', 'BReport', 'BPack', 'BGitHub', 'BImprove') { $script:G[$k].Enabled = -not $b }
+        foreach ($k in 'BTest', 'BFix', 'BLocate', 'BOpen', 'BReport', 'BPack', 'BGitHub', 'BImprove', 'BJavaUpdate', 'BCertificate') { $script:G[$k].Enabled = -not $b }
         $script:G.Prog.Visible = $b
         $script:G.Form.Cursor = $(if ($b) { [Windows.Forms.Cursors]::WaitCursor } else { [Windows.Forms.Cursors]::Default })
         [System.Windows.Forms.Application]::DoEvents()
@@ -2206,7 +2331,7 @@ function Start-Gui {
             $G = $script:G
             if ($G.List.SelectedItems.Count -eq 0) { return }
             $d = $ByNo[[int]$G.List.SelectedItems[0].Tag]; $r = $d.R
-            $lines = @("[$($d.No)] $($d.Title)", "Status : $(Get-Label $r.Status)    (first test: $(Get-Label $r.Before))", "State  : $($r.Value)", '')
+            $lines = @("[$($d.DisplayNo)] $($d.Title)", "Status : $(Get-Label $r.Status)    (first test: $(Get-Label $r.Before))", "State  : $($r.Value)", '')
             $lines += $r.Detail | ForEach-Object { "  $_" }
             if ($r.Status -in 'FAIL', 'SKIP' -or ($r.Status -eq 'WARN' -and $r.Fixable)) { $lines += ''; $lines += "Fix plan: $($d.Plan)" }
             if ($r.Actions.Count) { $lines += ''; $lines += 'What the tool did:'; $lines += $r.Actions | ForEach-Object { "  -> $_" } }
@@ -2216,28 +2341,19 @@ function Start-Gui {
     }
     function Update-Summary {
         $G = $script:G; $C = $script:GC
+        $G.BJavaUpdate.Visible = [bool]$script:JavaUpdateOffer.Available
+        if ($script:JavaUpdateOffer.Available) { $G.JavaTimer.Start() } else { $G.JavaTimer.Stop() }
+        $G.BCertificate.Visible = [bool]$ByNo[4].Last.ExpiredAccepted
         if ($Results['4'].Status -in 'OK', 'FIXED', 'WARN') { Start-Flash } else { Stop-Flash }
         $l = $Results['4']; $fails = @(Get-Failed); $fx = @(Get-Fixable); $warn = @($Defs | Where-Object { $_.R.Status -eq 'WARN' })
         $amberBg = [Drawing.Color]::FromArgb(253, 243, 225)
         $d3 = $ByNo[3]
-        if ($d3.Tested -and $d3.R.Status -in 'FAIL', 'SKIP' -and $d3.Last.NotInstalled) {
-            $G.Live.Text = "NOT INSTALLED  -  DigitalSignerService $($Cfg.DssVersion) is not installed in this system"; $G.Live.ForeColor = [Drawing.Color]::White; $G.Live.BackColor = $C.Bad
-            $G.Sub.Text = $(if (Find-DssPackageSource) { "Installer ready - item 3 is ticked: click 'Fix selected' to install DSS $($Cfg.DssVersion)." } else { "Click 'Locate installer' to select the DSS $($Cfg.DssVersion) zip / msi / folder, then 'Fix selected'." })
-            $G.Stat.Text = "$($fails.Count) check(s) FAILED"
-        } elseif ($fails.Count) {
-            $G.Live.Text = "NOT WORKING  -  isLive: $($l.Value)"; $G.Live.ForeColor = $C.Bad; $G.Live.BackColor = $C.BadBg
-            $G.Sub.Text = "$($fails.Count) problem(s) found. Ticked rows can be fixed - click 'Fix selected'. Click a row for details."
-            $G.Stat.Text = "$($fails.Count) check(s) FAILED"
-        } elseif ($warn.Count) {
-            $G.Live.Text = "WORKING, with warning(s)  -  isLive: $($l.Value)"; $G.Live.ForeColor = $C.Warn; $G.Live.BackColor = $amberBg
-            $G.Sub.Text = "isLive works. $($warn.Count) warning(s) - optional: click 'Fix selected' to remove them, or just Close."
-            $G.Stat.Text = 'WORKING with warnings'
-        } else {
-            $G.Live.Text = "ALL OK  -  isLive: $($l.Value)  -  nothing needs to be done"; $G.Live.ForeColor = $C.Ok; $G.Live.BackColor = $C.OkBg
-            if ($script:NotSecure) { $G.Sub.Text = "ALL OK - nothing needs to be done.  Note: running with 'Not Secure' - $($script:NotSecure)" }
-            if (-not $script:NotSecure) { $G.Sub.Text = "ALL OK - DSC signing is ready. Nothing needs to be done (use 'Run full check' for the detailed list)." }
-            $G.Stat.Text = 'ALL OK'
-        }
+        $state=Get-DscOverallState
+        $G.Live.Text=$state.Title + '  -  ' + $l.Value
+        $G.Live.ForeColor=$(if($state.Working){$C.Ok}elseif(-not $state.Verified){$C.Warn}else{$C.Bad})
+        $G.Live.BackColor=$(if($state.Working){$C.OkBg}elseif(-not $state.Verified){$amberBg}else{$C.BadBg})
+        $G.Sub.Text=$state.Detail
+        $G.Stat.Text=$state.Title + " | additional issues: $($state.Failures), warnings: $($state.Warnings)"
         $G.BFix.Enabled = ($fx.Count -gt 0)
         $miss = [bool]($ByNo[3].Tested -and $ByNo[3].R.Status -in 'FAIL', 'SKIP' -and $ByNo[3].Last.NotInstalled -and -not (Find-DssPackageSource))
         $G.BLocate.BackColor = $(if ($miss) { $C.Amber } else { (Get-SysColor Control) })
@@ -2245,18 +2361,13 @@ function Start-Gui {
     }
     function Invoke-GuiTest([switch]$Full) {
         Set-Busy $true; $script:G.LogMode = $true; $script:G.Txt.Clear()
-        if ($Full) {
-            $script:G.Sub.Text = 'Full check - nothing is changed ...'
-            Invoke-AllTests
-        } else {
-            Invoke-AllTests $QuickNos
-            if ((Get-QuickVerdict) -eq 'FAIL') {
-                $script:G.Sub.Text = 'Overall test FAILED - running the full check to find the cause (nothing is changed) ...'
-                Invoke-AllTests (@($Defs | Where-Object { -not $_.Tested } | ForEach-Object { $_.No }))
-            } else { Set-NotNeeded }
-        }
-        [void](Save-Results); Set-Busy $false; Update-Summary
-        if ($script:G.List.Items.Count) { $script:G.List.Items[3].Selected = $true }
+        try {
+            if ($Full) { [void](Invoke-StartupSequence -FullCheck) }
+            else { [void](Invoke-StartupSequence -OpenBrowser) }
+            [void](Save-Results)
+        } finally { Set-Busy $false }
+        Update-Summary
+        if ($script:G.List.Items.Count -gt 3) { foreach ($row in $script:G.List.Items) { if ([int]$row.Tag -eq 4) { $row.Selected = $true } } }
     }
     # DSS 4.1.8 not installed and no installer chosen: red pop-up with the same locate dialog, then test 3 again
     function Invoke-InstallerCheckGui {
@@ -2267,22 +2378,22 @@ function Start-Gui {
         $res = Show-PackageDialog "DigitalSignerService $($Cfg.DssVersion) is NOT INSTALLED in this system - select the installer (zip / msi / folder)"
         if ($res -eq 'ok') {
             Set-Busy $true; Invoke-AllTests @(3); [void](Save-Results); Set-Busy $false; Update-Summary
-            $script:G.List.Items[2].Selected = $true; Show-Detail
+            foreach ($row in $script:G.List.Items) { if ([int]$row.Tag -eq 3) { $row.Selected = $true } }; Show-Detail
         }
     }
-    # step 3: after the dashboard - fix ALL, choose the rows, or not now
+    # step 9: after the dashboard - fix ALL, choose the rows, or not now
     function Show-FixChoice {
         $fx = @(Get-Fixable); if (-not $fx.Count) { return }
         $C = $script:GC
         $d = New-Object Windows.Forms.Form
-        $d.Text = 'Step 3 - Run the fixes'; $d.Size = New-Object Drawing.Size(780, (250 + 20 * [Math]::Min($fx.Count, 10)))
+        $d.Text = 'Step 9 - Run the fixes'; $d.Size = New-Object Drawing.Size(780, (250 + 20 * [Math]::Min($fx.Count, 10)))
         $d.StartPosition = 'CenterParent'; $d.FormBorderStyle = 'FixedDialog'; $d.MaximizeBox = $false; $d.MinimizeBox = $false
         $d.Font = (New-UiFont 'Segoe UI' 9.5); $d.BackColor = [Drawing.Color]::White
         $hd = New-Object Windows.Forms.Label; $hd.UseMnemonic = $false; $hd.AutoSize = $false; $hd.Location = New-Object Drawing.Point(18, 12); $hd.Size = New-Object Drawing.Size(730, 26)
         $hd.Font = (New-UiFont 'Segoe UI Semibold' 11); $hd.Text = "$($fx.Count) item(s) on the dashboard can be fixed:"
         $lst = New-Object Windows.Forms.TextBox; $lst.Multiline = $true; $lst.ReadOnly = $true; $lst.ScrollBars = 'Vertical'
         $lst.Location = New-Object Drawing.Point(18, 42); $lst.Size = New-Object Drawing.Size(730, (40 + 20 * [Math]::Min($fx.Count, 10))); $lst.Font = (New-UiFont 'Consolas' 9)
-        $lst.Text = (($fx | ForEach-Object { "[$($_.No)] $($_.Title)  ($(Get-Label $_.R.Status))`r`n      -> $($_.Plan)" }) -join "`r`n")
+        $lst.Text = (($fx | ForEach-Object { "[$($_.DisplayNo)] $($_.Title)  ($(Get-Label $_.R.Status))`r`n      -> $($_.Plan)" }) -join "`r`n")
         $nt = New-Object Windows.Forms.Label; $nt.UseMnemonic = $false; $nt.AutoSize = $false; $nt.Size = New-Object Drawing.Size(730, 38)
         $nt.Location = New-Object Drawing.Point(18, ($lst.Top + $lst.Height + 8)); $nt.ForeColor = $C.Mute
         $nt.Text = 'Backups are saved first.' + $(if (-not $IsAdmin) { ' Windows will ask for administrator permission, then the tool reopens as administrator and continues.' } else { '' })
@@ -2311,7 +2422,7 @@ function Start-Gui {
         $G = $script:G
         if (-not $NoAsk) {
             $msg = "The tool will make these changes on this PC:`r`n`r`n"
-            foreach ($n in $nos) { $msg += "[$n] $($ByNo[$n].Title)`r`n      -> $($ByNo[$n].Plan)`r`n" }
+            foreach ($n in $nos) { $msg += "[$($ByNo[$n].DisplayNo)] $($ByNo[$n].Title)`r`n      -> $($ByNo[$n].Plan)`r`n" }
             $msg += "`r`nBackups are saved first."
             if (-not $IsAdmin) { $msg += "`r`n`r`nThis needs administrator rights: Windows will ask for permission, then the tool reopens as administrator and continues." }
             $msg += "`r`n`r`nContinue?"
@@ -2326,7 +2437,7 @@ function Start-Gui {
         Set-Busy $true; $G.LogMode = $true; $G.Txt.Clear(); $G.Sub.Text = 'Fixing ... please wait (Java / installer downloads can take a few minutes)'
         Invoke-Fixes $nos
         Say ''; Say 'Testing again ...' 'White'
-        Invoke-AllTests; [void](Save-Results); Set-Busy $false; Update-Summary
+        [void](Invoke-StartupSequence -FullCheck); [void](Save-Results); Set-Busy $false; Update-Summary
         Invoke-InstallerCheckGui
         $fails = @(Get-Failed)
         if ($Results['4'].Status -in 'OK', 'FIXED', 'WARN') {
@@ -2339,6 +2450,15 @@ function Start-Gui {
     $lv.Add_ItemCheck({ param($s, $e) $d = $ByNo[[int]$s.Items[$e.Index].Tag]; if (-not ($d.R.Status -in 'FAIL', 'SKIP' -or ($d.R.Status -eq 'WARN' -and $d.R.Fixable))) { $e.NewValue = 'Unchecked' } })
     $lv.Add_SelectedIndexChanged({ Invoke-UiSafe { Show-Detail } })
     $G.BTest.Add_Click({ Invoke-UiSafe { Invoke-GuiTest -Full; Invoke-InstallerCheckGui; Show-Detail; Show-FixChoice } })
+    $G.BCertificate.Add_Click({ Invoke-UiSafe { Show-SignerCertificateHelp -UseGui } })
+    $G.BJavaUpdate.Add_Click({ Invoke-UiSafe {
+        if (-not $IsAdmin) { [void][Windows.Forms.MessageBox]::Show('Reopen this tool in an Administrator PowerShell session and select Update Java.', 'Optional Java update'); return }
+        if ([Windows.Forms.MessageBox]::Show($script:JavaUpdateOffer.Text + "`r`nInstall this optional update?", 'Optional Java update', [Windows.Forms.MessageBoxButtons]::YesNo) -ne 'Yes') { return }
+        Set-Busy $true
+        try { [void](Invoke-OptionalJavaUpdate -Confirmed); Invoke-GuiTest -Full; Show-Detail }
+        finally { Set-Busy $false }
+    } })
+    $f.Add_FormClosed({ $script:UiJavaOffer = $null; $script:G.JavaTimer.Stop(); $script:G.JavaTimer.Dispose(); $script:G.Flash.Stop(); $script:G.Flash.Dispose() })
     $G.BClose.Add_Click({ Invoke-UiSafe { $script:G.Form.Close() } })
     $G.BReport.Add_Click({ Invoke-UiSafe { $rp = Save-Results; Start-Process $rp } })
     $G.BGitHub.Add_Click({ Invoke-UiSafe { Save-DscSession $Results; Show-DscGitHubReport -UseGui } })
@@ -2351,7 +2471,7 @@ function Start-Gui {
             Invoke-GuiTest; Invoke-InstallerCheckGui; Show-Detail; Show-FixChoice
         } else {
             Set-Busy $true; Invoke-AllTests @(3); [void](Save-Results); Set-Busy $false; Update-Summary
-            $script:G.List.Items[2].Selected = $true
+            foreach ($row in $script:G.List.Items) { if ([int]$row.Tag -eq 3) { $row.Selected = $true } }
         }
         Show-Detail
     } })
@@ -2361,7 +2481,7 @@ function Start-Gui {
         }
         Stop-Flash
         $o = Open-InBrowsers
-        [void][Windows.Forms.MessageBox]::Show("$($o.Text -replace '   \|   ', "`r`n")`r`n`r`nThe page must show:  success.  DSC Signer Service version : $($Cfg.DssVersion)`r`n('Not secure' in the address bar is expected.)", 'DSC isLive Service Test-Check', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information)
+        [void][Windows.Forms.MessageBox]::Show("$($o.Text -replace '   \|   ', "`r`n")`r`n`r`nThe page must show:  success.  DSC Signer Service version : $($Cfg.DssVersion)`r`nAn expiry-only alert may be accepted for this signer. Use Browser exception help where needed.", 'DSC isLive Service Test-Check', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information)
     } })
     $G.BPack.Add_Click({ Invoke-UiSafe {
         if ([Windows.Forms.MessageBox]::Show("Create ONE file (about 100 MB) that contains this tool and the DigitalSignerService $($Cfg.DssVersion) installer?`r`nIt will be saved next to this tool.", 'Build single-file tool', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question) -ne 'Yes') { return }
@@ -2378,7 +2498,7 @@ function Start-Gui {
         # one dialog for every place the installer is needed: start, 'Locate installer', DSS not installed, Fix
         $C = $script:GC
         $d = New-Object Windows.Forms.Form
-        $d.Text = $(if ($Start) { "Step 1 - DigitalSignerService $($Cfg.DssVersion) installer" } else { "Locate DigitalSignerService $($Cfg.DssVersion) installer" })
+        $d.Text = $(if ($Start) { "Step 2 - DigitalSignerService $($Cfg.DssVersion) installer" } else { "Locate DigitalSignerService $($Cfg.DssVersion) installer" })
         $d.Size = New-Object Drawing.Size(760, 300)
         $d.StartPosition = 'CenterParent'; $d.FormBorderStyle = 'FixedDialog'; $d.MaximizeBox = $false; $d.MinimizeBox = $false
         $d.Font = (New-UiFont 'Segoe UI' 9.5); $d.BackColor = [Drawing.Color]::White
@@ -2442,26 +2562,10 @@ function Start-Gui {
             if ($todo.Count) { Invoke-GuiFix $todo -NoAsk }
             else { [void][Windows.Forms.MessageBox]::Show('Nothing left to fix - it already works.', 'Fix', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) }
         } else {
-            # step 1: DSS 4.1.8 at its standard path? only if not -> ask for the installer package
-            $ver = $Cfg.DssVersion
-            $script:G.Sub.Text = "Step 1: checking $($Cfg.DssExePaths[0]) ..."; [System.Windows.Forms.Application]::DoEvents()
-            $t3 = Test-DssInstall
-            if (-not $t3.NotInstalled) {
-                Add-Detail $ByNo[3].R "Found: $($t3.Exe)"
-                $script:G.Live.Text = "DigitalSignerService $ver found: $($t3.Exe)"
-            } else {
-                $script:PkgAsked = $true
-                $script:G.Live.Text = "NOT INSTALLED  -  DigitalSignerService $ver is not installed in this system"
-                $script:G.Live.ForeColor = [Drawing.Color]::White; $script:G.Live.BackColor = $script:GC.Bad
-                $res = Show-PackageDialog "DigitalSignerService $ver is NOT INSTALLED in this system (Digital Signer Service.exe not found in its folder) - select the installer package to link it" -Start
-                if ($res -eq 'exit') { $script:G.Form.Close(); return }
-            }
-            # step 2: the fix dashboard (tests only)
-            $script:G.Sub.Text = 'Step 2: building the fix dashboard - testing isLive + Chrome / Edge / Firefox (nothing is changed) ...'
+            $script:G.Sub.Text = 'Step 1: opening isLive; expiry-only alerts are warnings. Continuing the ordered checks ...'
             Invoke-GuiTest
             Invoke-InstallerCheckGui
             Show-Detail
-            # step 3: fix all / selected / not now
             Show-FixChoice
         }
         Show-Detail
