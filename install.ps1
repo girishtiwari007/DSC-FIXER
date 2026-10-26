@@ -10,9 +10,168 @@ if ($env:OS -ne 'Windows_NT') { throw 'This tool requires Windows.' }
 if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
     throw 'Organization policy restricts this PowerShell session. Ask IT to approve this tool; it will not bypass that policy.'
 }
+# Session logging is embedded so each published entry point remains self-contained.
+function Initialize-DscSession([string]$Repository, [string]$ModeName) {
+    $script:DscSession = [ordered]@{
+        Schema = 1; ToolVersion = '2026.10.26.1'; Repository = $Repository
+        SessionId = [guid]::NewGuid().ToString('N'); StartedUtc = [DateTime]::UtcNow.ToString('o')
+        UpdatedUtc = ''; Mode = $ModeName; PowerShell = $PSVersionTable.PSVersion.ToString()
+        State = 'Running'; ErrorCount = 0; Checks = @(); Improvements = @()
+    }
+    $script:DscLoggingFailed = $false
+    $script:DscErrorKeys = @{}
+    $script:DscErrorGroups = @{}
+    $script:DscSessionDirectory = $null
+    $roots = @()
+    if ($env:DSSF_TESTROOT) { $roots = @((Join-Path $env:DSSF_TESTROOT 'out')) }
+    else {
+        if ($env:LOCALAPPDATA) { $roots += Join-Path $env:LOCALAPPDATA 'DSC-Signer-Fixer\sessions' }
+        if ($env:TEMP) { $roots += Join-Path $env:TEMP 'DSC-Signer-Fixer\sessions' }
+    }
+    foreach ($root in $roots) {
+        try {
+            $dir = Join-Path $root ((Get-Date -Format 'yyyy-MM-dd_HH-mm-ss') + '_' + $script:DscSession.SessionId)
+            [void][IO.Directory]::CreateDirectory($dir)
+            [IO.File]::WriteAllText((Join-Path $dir 'events.jsonl'), '', (New-Object Text.UTF8Encoding $false))
+            $script:DscSessionDirectory = $dir
+            break
+        } catch { }
+    }
+    if (-not $script:DscSessionDirectory) { throw 'Cannot create a local session log. Check write access to LOCALAPPDATA or TEMP; no repairs were started.' }
+    Write-DscEvent 'Info' 'Session started' @{ Mode = $ModeName }
+    Save-DscSession
+}
+function Write-DscEvent([string]$Level, [string]$Operation, $Data) {
+    if (-not $script:DscSessionDirectory) { return }
+    try {
+        $event = [ordered]@{ TimeUtc = [DateTime]::UtcNow.ToString('o'); SessionId = $script:DscSession.SessionId; Level = $Level; Operation = $Operation; Data = $Data }
+        $json = ConvertTo-Json -InputObject $event -Depth 8 -Compress
+        [IO.File]::AppendAllText((Join-Path $script:DscSessionDirectory 'events.jsonl'), $json + [Environment]::NewLine, (New-Object Text.UTF8Encoding $false))
+    } catch {
+        if (-not $script:DscLoggingFailed) { Write-Warning 'Session logging failed. Check free disk space and folder permissions.' }
+        $script:DscLoggingFailed = $true
+    }
+}
+function Write-DscError($Record, [string]$Operation = 'Unhandled exception', [Nullable[int]]$ExitCode = $null) {
+    if (-not $script:DscSession) { return }
+    $type = 'System.Exception'; $message = [string]$Record; $stack = ''; $line = 0; $errorId = ''
+    if ($Record -is [Management.Automation.ErrorRecord]) {
+        $type = $Record.Exception.GetType().FullName; $message = $Record.Exception.Message
+        $stack = $Record.ScriptStackTrace; $line = $Record.InvocationInfo.ScriptLineNumber
+        $errorId = $Record.FullyQualifiedErrorId
+    } elseif ($Record -is [Exception]) { $type = $Record.GetType().FullName; $message = $Record.Message; $stack = $Record.StackTrace }
+    $key = "$Operation|$([Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($Record))"
+    # The same caught ErrorRecord may reach the session trap; log it only once.
+    if ($script:DscErrorKeys.ContainsKey($key)) { return }
+    $script:DscErrorKeys[$key] = $true
+    $script:DscSession.ErrorCount++
+    # Only type and numeric line enter the public report. Messages and stack traces remain local.
+    $publicKey = "$type|$line|$ExitCode"
+    if (-not $script:DscErrorGroups.ContainsKey($publicKey)) {
+        $script:DscErrorGroups[$publicKey] = [ordered]@{ Type = $type; Line = $line; Count = 0; ExitCode = $ExitCode }
+    }
+    $script:DscErrorGroups[$publicKey].Count++
+    Write-DscEvent 'Error' $Operation @{ Type = $type; Message = $message; StackTrace = $stack; Line = $line; ErrorId = $errorId; ExitCode = $ExitCode }
+    Save-DscSession
+}
+function Save-DscSession($CheckResults, [string]$State = '') {
+    if (-not $script:DscSessionDirectory) { return }
+    try {
+        if ($null -ne $CheckResults) {
+            $script:DscSession.Checks = @($CheckResults.Values | ForEach-Object {
+                [ordered]@{ No = $_.No; Status = $_.Status; ActionsAttempted = @($_.Actions).Count; Advice = $_.Advice }
+            })
+        }
+        if ($State) { $script:DscSession.State = $State }
+        $script:DscSession.UpdatedUtc = [DateTime]::UtcNow.ToString('o')
+        $script:DscSession.Improvements = @($script:DscSession.Checks | Where-Object { $_.Status -in 'FAIL','SKIP','WARN','PENDING' } | ForEach-Object {
+            "Review check $($_.No) ($($_.Status)); see the local diagnostic report."
+        })
+        $doc = [ordered]@{}
+        foreach ($key in $script:DscSession.Keys) { $doc[$key] = $script:DscSession[$key] }
+        $doc.Errors = @($script:DscErrorGroups.Values)
+        $json = ConvertTo-Json -InputObject $doc -Depth 8
+        $file = Join-Path $script:DscSessionDirectory 'session.json'
+        [IO.File]::WriteAllText(($file + '.tmp'), $json, (New-Object Text.UTF8Encoding $false))
+        Move-Item -LiteralPath ($file + '.tmp') -Destination $file -Force -ErrorAction Stop
+        $report = Get-DscPublicReport
+        [IO.File]::WriteAllText((Join-Path $script:DscSessionDirectory 'github-report.md'), $report.Body, (New-Object Text.UTF8Encoding $false))
+    } catch {
+        if (-not $script:DscLoggingFailed) { Write-Warning 'Could not save the session summary. Existing logs have been retained.' }
+        $script:DscLoggingFailed = $true
+    }
+}
+function Get-DscPublicReport([ValidateSet('Error','Improvement')][string]$Kind = 'Error') {
+    # An allowlist is safer than trying to redact arbitrary exception messages or logs.
+    $repo = [string]$script:DscSession.Repository
+    if ($repo -notin @('girishtiwari007/DSC-FIX','girishtiwari007/DSC-FIXR','girishtiwari007/DSC-FIXER')) { throw 'Unsupported report repository.' }
+    $version = [string]$script:DscSession.ToolVersion
+    if ($version -notmatch '^\d{4}\.\d{2}\.\d{2}\.\d+$') { throw 'Invalid report version.' }
+    $checks = @($script:DscSession.Checks | Sort-Object { [int]$_.No } | Select-Object -First 10 | ForEach-Object {
+        $no = [int]$_.No; $status = [string]$_.Status
+        if ($no -ge 1 -and $no -le 10 -and $status -in 'OK','FIXED','WARN','FAIL','SKIP','NA','NOTRUN','PENDING') { "Check ${no}: $status; attempted actions: $([int]$_.ActionsAttempted)" }
+    })
+    $errors = @($script:DscErrorGroups.Values | Sort-Object Type,Line | Select-Object -First 12 | ForEach-Object {
+        if ($_.Type -match '^[A-Za-z][A-Za-z0-9_.+`]{0,160}$') {
+            $code = $(if ($null -ne $_.ExitCode) { "; exit code $([int]$_.ExitCode)" } else { '' })
+            "$($_.Type) at line $([int]$_.Line)$code (count $([int]$_.Count))"
+        }
+    })
+    $signature = "$repo|$version|$Kind|$($checks -join '|')|$($errors -join '|')"
+    # Counts do not affect grouping between sessions with the same underlying problem.
+    $signature = $signature -replace '; attempted actions: \d+', '' -replace '\(count \d+\)', ''
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $fingerprint = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($signature))).Replace('-','').Substring(0,16)).ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    $body = @(
+        "## DSC $Kind report", "Tool version: $version", "Fingerprint: dsc-$fingerprint", ''
+        '### Check summary', $(if ($checks.Count) { $checks -join "`n" } else { 'No checks completed.' }), ''
+        '### Exceptions', $(if ($errors.Count) { $errors -join "`n" } else { 'No exceptions recorded.' }), ''
+        '### Expected result / improvement', 'Describe what should happen here.', ''
+        '### Steps to reproduce', 'Add steps here. Do not include personal information, passwords, tokens or certificate files.', ''
+        'Generated from an allowlist. Exception messages, stack traces, file paths, logs, machine/user names and certificate contents are excluded.'
+    ) -join "`n"
+    return @{ Repository = $repo; Title = "[DSC $Kind] dsc-$fingerprint ($version)"; Body = $body; Fingerprint = $fingerprint }
+}
+function Show-DscGitHubReport([ValidateSet('Error','Improvement')][string]$Kind = 'Error', [switch]$UseGui) {
+    $report = Get-DscPublicReport $Kind
+    $reportPath = Join-Path $script:DscSessionDirectory 'github-report.md'
+    [IO.File]::WriteAllText($reportPath, $report.Body, (New-Object Text.UTF8Encoding $false))
+    $searchUrl = 'https://github.com/' + $report.Repository + '/issues?q=' + [Uri]::EscapeDataString('is:issue "dsc-' + $report.Fingerprint + '"')
+    $newUrl = 'https://github.com/' + $report.Repository + '/issues/new?title=' + [Uri]::EscapeDataString($report.Title) + '&body=' + [Uri]::EscapeDataString($report.Body)
+    if ($UseGui) {
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing -ErrorAction Stop
+        $dialog = New-Object Windows.Forms.Form
+        try {
+            $dialog.Text = 'Preview GitHub report'; $dialog.Size = New-Object Drawing.Size(760,620); $dialog.StartPosition = 'CenterScreen'
+            $text = New-Object Windows.Forms.TextBox; $text.Multiline = $true; $text.ReadOnly = $true; $text.ScrollBars = 'Vertical'; $text.Dock = 'Fill'; $text.Text = $report.Body.Replace("`n","`r`n")
+            $bar = New-Object Windows.Forms.FlowLayoutPanel; $bar.Dock = 'Bottom'; $bar.Height = 72
+            $hint = New-Object Windows.Forms.Label; $hint.Dock = 'Top'; $hint.Height = 52; $hint.Text = "Local preview: $reportPath`r`nSearch for this fingerprint first. GitHub opens in your browser; review and submit there. Offline? Keep this file and submit later."
+            $search = New-Object Windows.Forms.Button; $search.Text = 'Find existing'; $search.Width = 130
+            $create = New-Object Windows.Forms.Button; $create.Text = 'Open new issue'; $create.Width = 140
+            $close = New-Object Windows.Forms.Button; $close.Text = 'Close'; $close.Width = 100
+            $search.Add_Click({ try { Start-Process $searchUrl -ErrorAction Stop } catch { Write-DscError $_ 'Open GitHub search'; [void][Windows.Forms.MessageBox]::Show('Browser unavailable. The preview is saved locally.') } }.GetNewClosure())
+            $create.Add_Click({ try { Start-Process $newUrl -ErrorAction Stop } catch { Write-DscError $_ 'Open GitHub issue'; [void][Windows.Forms.MessageBox]::Show('Browser unavailable. The preview is saved locally.') } }.GetNewClosure())
+            $close.Add_Click({ $dialog.Close() }.GetNewClosure())
+            $bar.Controls.AddRange(@($search,$create,$close)); $dialog.Controls.AddRange(@($text,$hint,$bar)); [void]$dialog.ShowDialog()
+        } finally { $dialog.Dispose() }
+    } else {
+        Write-Host $report.Body
+        Write-Host "Preview saved: $reportPath"
+        $choice = Read-Host '[S] Search existing issues  [N] Open new issue  [Enter] Keep locally'
+        if ($choice -match '^(?i)s$') { Start-Process $searchUrl -ErrorAction Stop }
+        elseif ($choice -match '^(?i)n$') { Start-Process $newUrl -ErrorAction Stop }
+    }
+}
+
+Initialize-DscSession 'girishtiwari007/DSC-FIXER' $Mode
+try {
 $NativeSourcePath = $PSCommandPath
 function Invoke-DscNative {
     param([string]$RequestedMode)
+    $Results = $null
+    $script:DscSession.Mode = $RequestedMode
+    try {
     if ($RequestedMode -eq 'gui' -and [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
         Write-Host 'Windows popups require STA. Open Windows PowerShell (powershell.exe -STA), then run the native command again, or choose console mode.' -ForegroundColor Yellow
         return
@@ -71,10 +230,8 @@ function Get-MockState { Get-Content $StateFile -Raw | ConvertFrom-Json }
 function Save-MockState($s) { $s | ConvertTo-Json -Depth 12 | Set-Content -Path $StateFile -Encoding UTF8 }
 
 # ---------------------------------------------------------------- run folder, logging
-if ($TestMode) { $WorkDir = Join-Path $TestRoot 'out' } else { $WorkDir = Join-Path $env:ProgramData 'DSC-Signer-Fixer' }
-$RunDir  = Join-Path $WorkDir (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')
-try { New-Item -ItemType Directory -Force -Path $RunDir -ErrorAction Stop | Out-Null; [IO.File]::WriteAllText((Join-Path $RunDir 'fix-log.txt'), '') }
-catch { $WorkDir = Join-Path $env:LOCALAPPDATA 'DSC-Signer-Fixer'; $RunDir = Join-Path $WorkDir (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'); New-Item -ItemType Directory -Force -Path $RunDir | Out-Null }
+$WorkDir = Split-Path -Parent $script:DscSessionDirectory
+$RunDir = $script:DscSessionDirectory
 $LogFile = Join-Path $RunDir 'fix-log.txt'
 $SelfPath = $NativeSourcePath
 if ($SelfPath) { $SelfDir = Split-Path -Parent $SelfPath } else { $SelfDir = (Get-Location).Path }
@@ -95,7 +252,7 @@ function Wait-Proc($p, [int]$ms) {
 if (-not $TestMode -and $env:SystemRoot) {
     $env:Path = "$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem;$env:SystemRoot\System32\WindowsPowerShell\v1.0;" + $env:Path
 }
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { Write-DscError $_ 'Caught exception';}
 
 # ---------------------------------------------------------------- HTTPS helper (strict = Windows certificate trust)
 if (-not ('DssfHttp' -as [type])) {
@@ -134,7 +291,7 @@ public static class DssfHttp {
         return r;
     }
 }
-'@ } catch { Write-Host "HTTPS helper could not be compiled: $($_.Exception.Message)" -ForegroundColor Red }
+'@ } catch { Write-DscError $_ 'Caught exception'; Write-Host "HTTPS helper could not be compiled: $($_.Exception.Message)" -ForegroundColor Red }
 }
 
 # =====================================================================
@@ -191,7 +348,7 @@ function Send-EnvChanged {
         }
         $r = [UIntPtr]::Zero
         [DssfNative]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$r) | Out-Null
-    } catch { Log "broadcast failed: $_" }
+    } catch { Write-DscError $_ 'Caught exception'; Log "broadcast failed: $_" }
 }
 
 function Get-EffectivePathEntries {
@@ -221,18 +378,18 @@ function Resolve-Signer {
         }
         return @()
     }
-    try { return @([Net.Dns]::GetHostAddresses($Cfg.SignerHost) | ForEach-Object { $_.IPAddressToString }) } catch { return @() }
+    try { return @([Net.Dns]::GetHostAddresses($Cfg.SignerHost) | ForEach-Object { $_.IPAddressToString }) } catch { Write-DscError $_ 'Caught exception'; return @() }
 }
 
 function Get-ProcInfo([int]$ProcId) {
     $o = [ordered]@{ Id = $ProcId; Name = '?'; Path = ''; Service = '' }
     if ($TestMode -or -not $IsWindowsHost) {
-        try { $o.Path = ((Get-Content "/proc/$ProcId/cmdline" -Raw) -replace "`0", ' ').Trim() } catch {}
-        try { $o.Name = (Get-Content "/proc/$ProcId/comm" -Raw).Trim() } catch {}
+        try { $o.Path = ((Get-Content "/proc/$ProcId/cmdline" -Raw) -replace "`0", ' ').Trim() } catch { Write-DscError $_ 'Caught exception';}
+        try { $o.Name = (Get-Content "/proc/$ProcId/comm" -Raw).Trim() } catch { Write-DscError $_ 'Caught exception';}
         return [pscustomobject]$o
     }
     $p = Get-Process -Id $ProcId -ErrorAction SilentlyContinue
-    if ($p) { $o.Name = $p.ProcessName; try { $o.Path = $p.Path } catch {} }
+    if ($p) { $o.Name = $p.ProcessName; try { $o.Path = $p.Path } catch { Write-DscError $_ 'Caught exception';} }
     $svc = Get-CimInstance Win32_Service -Filter "ProcessId=$ProcId" -ErrorAction SilentlyContinue
     if ($svc) { $o.Service = (@($svc) | ForEach-Object { $_.Name }) -join ',' }
     return [pscustomobject]$o
@@ -270,7 +427,7 @@ function Get-PortListeners {
         }
     } else {
         try { $ids = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop | ForEach-Object { [int]$_.OwningProcess }) }
-        catch { $ids = @(ConvertFrom-NetstatText (netstat -ano -p tcp) $port | Where-Object { $_.State -eq 'LISTENING' } | ForEach-Object { $_.Pid }) }
+        catch { Write-DscError $_ 'Caught exception'; $ids = @(ConvertFrom-NetstatText (netstat -ano -p tcp) $port | Where-Object { $_.State -eq 'LISTENING' } | ForEach-Object { $_.Pid }) }
     }
     return @($ids | Sort-Object -Unique | ForEach-Object { Get-ProcInfo $_ })
 }
@@ -297,7 +454,7 @@ function Get-DssStdExe {
     return $null
 }
 function Get-ExeVersion([string]$exe) {
-    try { $vi = (Get-Item -LiteralPath $exe).VersionInfo; foreach ($v in @($vi.ProductVersion, $vi.FileVersion)) { if ($v -and $v -match '^\s*(\d+\.\d+\.\d+)') { return $matches[1] } } } catch {}
+    try { $vi = (Get-Item -LiteralPath $exe).VersionInfo; foreach ($v in @($vi.ProductVersion, $vi.FileVersion)) { if ($v -and $v -match '^\s*(\d+\.\d+\.\d+)') { return $matches[1] } } } catch { Write-DscError $_ 'Caught exception';}
     return ''
 }
 function Find-DssExe {
@@ -330,13 +487,13 @@ function Get-DssProcesses {
     $res = @()
     if ($TestMode -or -not $IsWindowsHost) {
         foreach ($d in (Get-ChildItem /proc -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d+$' })) {
-            try { $cl = (Get-Content "/proc/$($d.Name)/cmdline" -Raw -ErrorAction Stop) -replace "`0", ' ' } catch { continue }
+            try { $cl = (Get-Content "/proc/$($d.Name)/cmdline" -Raw -ErrorAction Stop) -replace "`0", ' ' } catch { Write-DscError $_ 'Caught exception'; continue }
             if ($cl -match 'Digital ?Signer ?Service' -and $cl -notmatch 'pwsh|bash -c|\.bat') { $res += [pscustomobject]@{ Id = [int]$d.Name; Name = 'DigitalSignerService'; Path = $cl } }
         }
         return $res
     }
     foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
-        $path = ''; try { $path = $p.Path } catch {}
+        $path = ''; try { $path = $p.Path } catch { Write-DscError $_ 'Caught exception';}
         if ($p.ProcessName -match '(?i)signer' -or $path -match '(?i)\\Digital Signer Service\\') { $res += [pscustomobject]@{ Id = $p.Id; Name = $p.ProcessName; Path = $path } }
     }
     return $res
@@ -388,7 +545,7 @@ function Get-MsiIdentity([string]$path) {
         $id.Name = $fi.Name; $id.SizeMB = [Math]::Round($fi.Length / 1MB)
         $script:PkgIdCache[$key] = $id
         return $id
-    } catch { Log "msi check failed $path : $($_.Exception.Message)"; return @{ IsMsi = $false; IsDss = $false; Version = ''; Error = $_.Exception.Message; Name = (Split-Path -Leaf $path) } }
+    } catch { Write-DscError $_ 'Caught exception'; Log "msi check failed $path : $($_.Exception.Message)"; return @{ IsMsi = $false; IsDss = $false; Version = ''; Error = $_.Exception.Message; Name = (Split-Path -Leaf $path) } }
 }
 # best DSS msi inside a zip (any file names); returns @{ Name; Version; IsDss } or $null
 function Get-ZipMsiInfo([string]$zip) {
@@ -410,7 +567,7 @@ function Get-ZipMsiInfo([string]$zip) {
         } finally { $z.Dispose() }
         $script:PkgIdCache[$key] = $best
         return $best
-    } catch { Log "zip read failed $zip : $($_.Exception.Message)"; return $null }
+    } catch { Write-DscError $_ 'Caught exception'; Log "zip read failed $zip : $($_.Exception.Message)"; return $null }
 }
 function Get-ZipMsiName([string]$zip) { $i = Get-ZipMsiInfo $zip; if ($i) { return $i.Name }; return $null }
 function Find-InFolder([string]$dir) {
@@ -441,7 +598,7 @@ function Test-PackagePath([string]$p) {
         if (Test-Path -LiteralPath $p -PathType Container) { return (Find-InFolder $p) }
         if ($p -match '(?i)\.msi$') { $id = Get-MsiIdentity $p; return @{ Kind = 'msi'; Path = $p; Text = $p; Version = $id.Version; Id = $id } }
         if ($p -match '(?i)\.zip$') { $i = Get-ZipMsiInfo $p; if ($i) { return @{ Kind = 'zip'; Path = $p; Text = "$p  ($($i.Name))"; Version = $i.Version } } }
-    } catch { Log "package check failed $p : $($_.Exception.Message)" }
+    } catch { Write-DscError $_ 'Caught exception'; Log "package check failed $p : $($_.Exception.Message)" }
     return $null
 }
 # where is the 4.1.8 installer? (no extraction - safe to call while only testing)
@@ -452,7 +609,7 @@ function Get-DownloadsFolder {
     try {
         $v = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop).'{374DE290-123F-4565-9164-39C4925E467B}'
         if ($v) { $v = [Environment]::ExpandEnvironmentVariables($v); if (Test-Path -LiteralPath $v) { return $v } }
-    } catch {}
+    } catch { Write-DscError $_ 'Caught exception';}
     return (Join-Path $env:USERPROFILE 'Downloads')
 }
 function Find-DssPackageSource {
@@ -469,7 +626,7 @@ function Find-DssPackageSource {
 # returns the MSI path, unpacking a zip / the embedded package when needed
 # download with resume, system proxy, browser user-agent, progress and plain-language errors
 function Get-WebFileResume([string]$Url, [string]$OutFile, [int]$Tries = 4) {
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { Write-DscError $_ 'Caught exception';}
     $part = "$OutFile.part"; $why = ''
     for ($try = 1; $try -le $Tries; $try++) {
         $have = 0; if (Test-Path -LiteralPath $part) { $have = (Get-Item -LiteralPath $part).Length }
@@ -478,7 +635,7 @@ function Get-WebFileResume([string]$Url, [string]$OutFile, [int]$Tries = 4) {
             $req = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
             $req.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 DSC-Signer-Fixer'
             $req.Timeout = 30000; $req.ReadWriteTimeout = 60000; $req.AllowAutoRedirect = $true
-            try { $req.Proxy = [Net.WebRequest]::GetSystemWebProxy(); $req.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials } catch {}
+            try { $req.Proxy = [Net.WebRequest]::GetSystemWebProxy(); $req.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials } catch { Write-DscError $_ 'Caught exception';}
             if ($have -gt 0) { $req.AddRange([long]$have) }
             $resp = $req.GetResponse()
             $append = ($have -gt 0 -and [int]$resp.StatusCode -eq 206)
@@ -500,10 +657,10 @@ function Get-WebFileResume([string]$Url, [string]$OutFile, [int]$Tries = 4) {
             Write-Progress -Activity 'Downloading DigitalSignerService 4.1.8 package' -Completed
             Move-Item -LiteralPath $part -Destination $OutFile -Force
             return @{ Ok = $true; Text = 'downloaded' }
-        } catch {
+        } catch { Write-DscError $_ 'Caught exception';
             $ex = $_.Exception; while ($ex.InnerException -and $ex -isnot [Net.WebException]) { $ex = $ex.InnerException }
             $we = $ex -as [Net.WebException]; $code = 0
-            if ($we -and $we.Response) { try { $code = [int]$we.Response.StatusCode } catch {} }
+            if ($we -and $we.Response) { try { $code = [int]$we.Response.StatusCode } catch { Write-DscError $_ 'Caught exception';} }
             $why = $ex.Message; $retry = $true
             if ($we) {
                 switch -Regex ($we.Status.ToString()) {
@@ -526,9 +683,9 @@ function Get-WebFileResume([string]$Url, [string]$OutFile, [int]$Tries = 4) {
             if (-not $retry) { break }
             Start-Sleep -Seconds ([Math]::Min(2 * $try, 8))
         } finally {
-            if ($out) { try { $out.Close() } catch {} }
-            if ($in) { try { $in.Close() } catch {} }
-            if ($resp) { try { $resp.Close() } catch {} }
+            if ($out) { try { $out.Close() } catch { Write-DscError $_ 'Caught exception';} }
+            if ($in) { try { $in.Close() } catch { Write-DscError $_ 'Caught exception';} }
+            if ($resp) { try { $resp.Close() } catch { Write-DscError $_ 'Caught exception';} }
         }
     }
     # last resort: Windows background transfer (works through most company proxies)
@@ -538,7 +695,7 @@ function Get-WebFileResume([string]$Url, [string]$OutFile, [int]$Tries = 4) {
             Start-BitsTransfer -Source $Url -Destination $OutFile -DisplayName 'DSC Signer package' -ErrorAction Stop
             Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
             return @{ Ok = $true; Text = 'downloaded (BITS)' }
-        } catch { $why = "$why | BITS: $($_.Exception.Message)" }
+        } catch { Write-DscError $_ 'Caught exception'; $why = "$why | BITS: $($_.Exception.Message)" }
     }
     return @{ Ok = $false; Text = $why }
 }
@@ -579,7 +736,7 @@ function Get-DssPackageFromWeb {
     $x = Test-PackagePath $zip
     if (-not $x) {
         $dir = Join-Path $RunDir 'web-package'
-        try { Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force } catch { Say "      The download is not a usable zip: $($_.Exception.Message)" 'Red'; return $false }
+        try { Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force } catch { Write-DscError $_ 'Caught exception'; Say "      The download is not a usable zip: $($_.Exception.Message)" 'Red'; return $false }
         if (-not (Find-InFolder $dir)) {
             foreach ($bat in @(Get-ChildItem -LiteralPath $dir -Recurse -File -Filter *.bat | Where-Object { $_.Length -gt 1MB })) {
                 $pz = Join-Path $dir 'payload.zip'
@@ -613,7 +770,7 @@ function Get-DssPackageMsi {
     }
     $dest = Join-Path $RunDir 'pkg'
     Say "      Unpacking $(Split-Path -Leaf $zip) ..."
-    try { Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force } catch { Log "unzip failed: $_"; return $null }
+    try { Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force } catch { Write-DscError $_ 'Caught exception'; Log "unzip failed: $_"; return $null }
     $x = Find-InFolder $dest
     if ($x -and $x.Kind -eq 'msi') { $script:PkgMsi = $x.Path; return $x.Path }
     return $null
@@ -644,7 +801,7 @@ function Test-PackageValid([string]$p) {
         }
         if ($x.Version -and $x.Version -ne $ver) { return @{ Ok = $false; Text = "Found DigitalSignerService $($x.Version), but version $ver is needed: $($x.Text)" } }
         return @{ Ok = $true; Text = "VALID - $($x.Text)  (DigitalSignerService $ver)"; Path = $p }
-    } catch {
+    } catch { Write-DscError $_ 'Caught exception';
         Log "validate failed $p : $($_.Exception.Message)"
         return @{ Ok = $false; Text = "Could not check this location: $($_.Exception.Message)" }
     }
@@ -678,7 +835,7 @@ function Show-PickPackage([string]$what) {
             $d.Filter = 'DSS installer (*.zip;*.msi)|*.zip;*.msi|All files (*.*)|*.*'
             if ($d.ShowDialog() -eq 'OK') { return $d.FileName }
         }
-    } catch { Log "dialog failed: $_" }
+    } catch { Write-DscError $_ 'Caught exception'; Log "dialog failed: $_" }
     return $null
 }
 
@@ -691,9 +848,20 @@ function Build-PortableTool {
 function Invoke-Exe([string]$File, [string]$ArgLine, [int]$TimeoutSec = 900) {
     Log "RUN $File $ArgLine"
     if ($TestMode) { return 0 }
-    $p = Start-Process -FilePath $File -ArgumentList $ArgLine -PassThru -WindowStyle Hidden
-    if (-not (Wait-Proc $p ($TimeoutSec * 1000))) { try { $p.Kill() } catch {}; return -1 }
-    return $p.ExitCode
+    Write-DscEvent 'Info' 'Process started' @{ File = $File; TimeoutSeconds = $TimeoutSec }
+    $p = Start-Process -FilePath $File -ArgumentList $ArgLine -PassThru -WindowStyle Hidden -ErrorAction Stop
+    try {
+        if (-not (Wait-Proc $p ($TimeoutSec * 1000))) {
+            try { $p.Kill() } catch { Write-DscError $_ 'Stop timed out process' }
+            Write-DscError (New-Object TimeoutException('Process exceeded its timeout.')) 'Process timeout'
+            Write-DscEvent 'Error' 'Process exited' @{ File = $File; ExitCode = -1 }
+            return -1
+        }
+        $code = $p.ExitCode
+        Write-DscEvent 'Info' 'Process exited' @{ File = $File; ExitCode = $code }
+        if ($code -notin 0,3010,1641) { Write-DscError (New-Object InvalidOperationException("Process failed with exit code $code.")) 'Process failed' -ExitCode $code }
+        return $code
+    } finally { $p.Dispose() }
 }
 
 # =====================================================================
@@ -754,7 +922,7 @@ function Ask([string]$q, [string[]]$valid, [string]$def) {
 # =====================================================================
 function Test-Hosts {
     $info = @(); $path = Get-HostsPath; $h = [regex]::Escape($Cfg.SignerHost)
-    try { $lines = [IO.File]::ReadAllLines($path) } catch { return @{ Pass = $false; Info = @("hosts file cannot be read ($($_.Exception.Message))"); Advice = 'Antivirus / policy is blocking the hosts file. Allow C:\Windows\System32\drivers\etc\hosts in the antivirus (hosts-file protection) and run again.' } }
+    try { $lines = [IO.File]::ReadAllLines($path) } catch { Write-DscError $_ 'Caught exception'; return @{ Pass = $false; Info = @("hosts file cannot be read ($($_.Exception.Message))"); Advice = 'Antivirus / policy is blocking the hosts file. Allow C:\Windows\System32\drivers\etc\hosts in the antivirus (hosts-file protection) and run again.' } }
     $good = 0; $bad = @()
     foreach ($l in $lines) {
         if ($l -notmatch $h) { continue }
@@ -773,8 +941,8 @@ function Test-Hosts {
 function Repair-Hosts($r) {
     $path = Get-HostsPath; $h = [regex]::Escape($Cfg.SignerHost)
     Copy-Item -LiteralPath $path -Destination (Join-Path $RunDir 'hosts.backup') -Force -ErrorAction SilentlyContinue
-    try { $fi = Get-Item -LiteralPath $path -Force; if ($fi.Attributes -band [IO.FileAttributes]::ReadOnly) { $fi.Attributes = $fi.Attributes -bxor [IO.FileAttributes]::ReadOnly; Add-Action $r 'Removed read-only flag from hosts file' } } catch {}
-    $lines = @(); try { $lines = [IO.File]::ReadAllLines($path) } catch {}
+    try { $fi = Get-Item -LiteralPath $path -Force; if ($fi.Attributes -band [IO.FileAttributes]::ReadOnly) { $fi.Attributes = $fi.Attributes -bxor [IO.FileAttributes]::ReadOnly; Add-Action $r 'Removed read-only flag from hosts file' } } catch { Write-DscError $_ 'Caught exception';}
+    $lines = @(); try { $lines = [IO.File]::ReadAllLines($path) } catch { Write-DscError $_ 'Caught exception';}
     $out = New-Object System.Collections.Generic.List[string]
     foreach ($l in $lines) {
         if ($l -match $h) {
@@ -788,7 +956,7 @@ function Repair-Hosts($r) {
     try {
         [IO.File]::WriteAllText($path, (($out -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
         Add-Action $r "hosts file rewritten with '127.0.0.1 $($Cfg.SignerHost)' (old copy saved as hosts.backup)"
-    } catch {
+    } catch { Write-DscError $_ 'Caught exception';
         Add-Action $r "Could not write hosts file: $($_.Exception.Message)"
         $r.Advice = 'Antivirus is blocking hosts file changes. Temporarily disable its hosts/system-file protection and run again.'
         return
@@ -904,7 +1072,7 @@ function Get-JavaLatest {
                 $o.Url = [Net.WebUtility]::HtmlDecode($matches[1]); break
             }
         }
-    } catch { $o.Error = $_.Exception.Message }
+    } catch { Write-DscError $_ 'Caught exception'; $o.Error = $_.Exception.Message }
     $script:JavaLatest = $o; return $o
 }
 function Get-InstalledJava {
@@ -926,8 +1094,8 @@ function Test-JavaLatest {
     if ($lat.Update -gt 0) { $info += "Latest on java.com: Java 8 Update $($lat.Update)" }
     else { $info += "Could not read latest version from java.com (no internet or page changed) $($lat.Error)" }
     if (-not $best) { return @{ Pass = $false; Info = $info; Advice = "Install Java manually from $($Cfg.JavaManualUrl) (Windows Offline 64-bit)." } }
-    if ($lat.Update -eq 0) { return @{ Pass = $true; Warn = $true; Value = "Java 8 Update $($best.Update) (latest not checked - offline)"; Info = $info + 'Internet check not possible - installed Java kept' } }
     if (-not $best.Is64) { return @{ Pass = $false; Info = $info + 'Only 32-bit Java found, 64-bit needed'; Advice = "Install Java 64-bit from $($Cfg.JavaManualUrl)." } }
+    if ($lat.Update -eq 0) { return @{ Pass = $true; Warn = $true; Value = "Java 8 Update $($best.Update) (latest not checked - offline)"; Info = $info + 'Internet check not possible - installed Java kept' } }
     if ($best.Update -lt $lat.Update) { return @{ Pass = $false; Info = $info + "Installed Update $($best.Update) is older than $($lat.Update)"; Advice = "Install the latest Java (Windows Offline 64-bit) from $($Cfg.JavaManualUrl)." } }
     return @{ Pass = $true; Value = "Java 8 Update $($best.Update) (64-bit) = latest"; Info = @("Java 8 Update $($best.Update) (64-bit) installed = latest") }
 }
@@ -947,7 +1115,7 @@ function Install-JavaLatest($r) {
             Add-Action $r "Java installer finished (exit code $code)"
             $done = ($code -eq 0 -or $code -eq 3010)
             Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
-        } catch { Add-Action $r "Java download/install failed: $($_.Exception.Message)" }
+        } catch { Write-DscError $_ 'Caught exception'; Add-Action $r "Java download/install failed: $($_.Exception.Message)" }
     }
     if (-not $done -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         Say '      Trying winget ...'
@@ -979,7 +1147,7 @@ function Test-JavaWorks {
         $saved = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         $out = (& $exe -version 2>&1 | ForEach-Object { "$_" }) -join ' '
         $code = $LASTEXITCODE; $ErrorActionPreference = $saved
-    } catch { $out = $_.Exception.Message }
+    } catch { Write-DscError $_ 'Caught exception'; $out = $_.Exception.Message }
     $ver = ''; if ($out -match 'version\s+"([^"]+)"') { $ver = $matches[1] }
     if ($code -ne 0 -or -not $ver) { return @{ Pass = $false; Info = @("java -version failed (exit $code): $out"); Kind = 'broken'; Exe = $exe; Advice = 'Uninstall all Java versions from Control Panel, reboot, then run this tool again.' } }
     $info = @("java -version OK: $ver  ($exe)")
@@ -1104,28 +1272,37 @@ function Test-DssInstall {
 }
 function Repair-DssInstall($r, $t, [switch]$ForceRepair) {
     if (-not $t) { $t = Test-DssInstall }
-    Stop-Dss $r
-    foreach ($o in $t.Old) {
-        if ($o.UninstallString -match '\{[0-9A-Fa-f\-]{36}\}') {
-            $g = $matches[0]
-            if ($TestMode) { Invoke-MockUninstall $o.DisplayName } else { $c = Invoke-Exe 'msiexec.exe' "/x $g /qn /norestart"; Log "uninstall exit $c" }
-            Add-Action $r "Uninstalled old '$($o.DisplayName)' (version $($o.DisplayVersion))"
-        } else { Add-Action $r "Please uninstall '$($o.DisplayName)' from Control Panel (no silent uninstaller)" }
-    }
+    # Secure and validate the replacement BEFORE stopping or removing anything.
     $msi = Get-DssPackageMsi
     if (-not $msi -and $script:RequestPackage) { if (& $script:RequestPackage) { $msi = Get-DssPackageMsi } }
-    if (-not $msi) { Add-Action $r "Installer package $($Cfg.DssVersion) not found - nothing installed"; return }
+    if (-not $msi) { throw "Installer package $($Cfg.DssVersion) is unavailable; DSS was not stopped or uninstalled." }
+    $valid = Test-PackageValid $msi
+    if (-not $valid.Ok) { throw "Replacement installer rejected: $($valid.Text). DSS was not stopped or uninstalled." }
+    Stop-Dss $r
+    foreach ($o in $t.Old) {
+        if ($o.UninstallString -notmatch '\{[0-9A-Fa-f\-]{36}\}') { throw "Cannot safely uninstall '$($o.DisplayName)'; use Control Panel, then retry." }
+        $g = $matches[0]
+        if ($TestMode) { Invoke-MockUninstall $o.DisplayName; $c = 0 }
+        else { $c = Invoke-Exe 'msiexec.exe' "/x $g /qn /norestart" }
+        if ($c -notin 0,3010,1641) { throw "DSS uninstall failed (exit $c). Installation was not continued." }
+        Add-Action $r "Uninstalled old '$($o.DisplayName)' (exit $c)"
+        if ($c -in 3010,1641) { $r.Advice = 'Restart Windows, then run the checks again before continuing installation.'; throw "DSS uninstall requires a restart (exit $c); further installation deferred." }
+    }
+    # The pre-uninstall snapshot may contain a path that no longer exists.
+    $t = Test-DssInstall
     $log = Join-Path $RunDir 'dss-install.log'
     if (($t.Good.Count -or $t.Exe) -and ($ForceRepair -or -not $t.Exe)) {
-        Say '      Repairing Digital Signer Service ...'
-        if ($TestMode) { Invoke-MockDssInstall } else { $c = Invoke-Exe 'msiexec.exe' ("/fa `"$msi`" /qn /norestart /l*v `"$log`""); Add-Action $r "Repair install finished (exit code $c)" }
-        Add-Action $r 'Re-installed program files (repair)'
+        if ($TestMode) { Invoke-MockDssInstall; $c = 0 }
+        else { $c = Invoke-Exe 'msiexec.exe' ("/fa `"$msi`" /qn /norestart /l*v `"$log`"") }
+        if ($c -notin 0,3010,1641) { throw "DSS repair failed (exit $c). See dss-install.log." }
+        Add-Action $r "Repaired program files (exit $c)"
     } elseif (-not $t.Exe) {
-        Say '      Installing Digital Signer Service 4.1.8 (silent) ...'
-        if ($TestMode) { Invoke-MockDssInstall; $c = 0 } else { $c = Invoke-Exe 'msiexec.exe' ("/i `"$msi`" /qn /norestart ALLUSERS=1 /l*v `"$log`"") }
-        Add-Action $r "Installed from $(Split-Path -Leaf $msi) (exit code $c)"
-        if ($c -ne 0 -and $c -ne 3010) { $r.Advice = "Silent install failed (code $c). See dss-install.log in $RunDir, or run the MSI manually as administrator." }
+        if ($TestMode) { Invoke-MockDssInstall; $c = 0 }
+        else { $c = Invoke-Exe 'msiexec.exe' ("/i `"$msi`" /qn /norestart ALLUSERS=1 /l*v `"$log`"") }
+        if ($c -notin 0,3010,1641) { throw "DSS installation failed (exit $c). See dss-install.log." }
+        Add-Action $r "Installed DigitalSignerService $($Cfg.DssVersion) (exit $c)"
     }
+    if ($c -in 3010,1641) { $r.Advice = 'Installer requires a Windows restart. Restart, then run checks again.' }
 }
 
 # =====================================================================
@@ -1177,7 +1354,7 @@ function Get-CertReason([byte[]]$raw, [string]$sslErr) {
             if ($now -lt $c.NotBefore) { return "the signer's certificate is valid only from $($c.NotBefore.ToString('dd-MMM-yyyy')) - check the PC date/time" }
             $why = "certificate issued by '$($c.GetNameInfo('SimpleName', $true))' is not trusted on this PC ($sslErr)"
         }
-    } catch {}
+    } catch { Write-DscError $_ 'Caught exception';}
     return $why
 }
 function Test-IsLive {
@@ -1256,7 +1433,7 @@ function Set-DssRunAsAdmin($r) {
                     Register-ScheduledTask -TaskName $tn -Action $a -Trigger $tr -Principal $pr -Settings $st -Force | Out-Null
                     Add-Action $r "Auto-start at logon (as admin) created for $user"
                 }
-            } catch { Log "task: $_" }
+            } catch { Write-DscError $_ 'Caught exception'; Log "task: $_" }
         }
     }
 }
@@ -1332,13 +1509,13 @@ function Find-Browser([string]$Name) {
         'Firefox' {
             $cands += "$pf\Mozilla Firefox\firefox.exe", "$pf86\Mozilla Firefox\firefox.exe", "$la\Mozilla Firefox\firefox.exe"
             foreach ($mk in 'HKLM:\SOFTWARE\Mozilla\Mozilla Firefox', 'HKLM:\SOFTWARE\WOW6432Node\Mozilla\Mozilla Firefox', 'HKCU:\SOFTWARE\Mozilla\Mozilla Firefox') {
-                try { $cv = (Get-ItemProperty $mk -ErrorAction Stop).CurrentVersion; if ($cv) { $px = (Get-ItemProperty "$mk\$cv\Main" -ErrorAction Stop).PathToExe; if ($px) { $cands += $px } } } catch {}
+                try { $cv = (Get-ItemProperty $mk -ErrorAction Stop).CurrentVersion; if ($cv) { $px = (Get-ItemProperty "$mk\$cv\Main" -ErrorAction Stop).PathToExe; if ($px) { $cands += $px } } } catch { Write-DscError $_ 'Caught exception';}
             }
         }
     }
     $cands = @($cands | Where-Object { $_ })
     foreach ($c in $cands) {
-        try { if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return [pscustomobject]@{ Name = $Name; Exe = $c; Version = "$((Get-Item -LiteralPath $c).VersionInfo.ProductVersion)" } } } catch {}
+        try { if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return [pscustomobject]@{ Name = $Name; Exe = $c; Version = "$((Get-Item -LiteralPath $c).VersionInfo.ProductVersion)" } } } catch { Write-DscError $_ 'Caught exception';}
     }
     return $null
 }
@@ -1356,8 +1533,8 @@ function Invoke-HeadlessCheck($b) {
     $res = @{ Html = ''; Err = '' }
     try {
         $p = Start-Process -FilePath $b.Exe -ArgumentList $al -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
-        if (-not (Wait-Proc $p 45000)) { try { $p.Kill() } catch {} }
-    } catch { Log "headless failed: $_"; $res.Err = "$($_.Exception.Message)" }
+        if (-not (Wait-Proc $p 45000)) { try { $p.Kill() } catch { Write-DscError $_ 'Caught exception';} }
+    } catch { Write-DscError $_ 'Caught exception'; Log "headless failed: $_"; $res.Err = "$($_.Exception.Message)" }
     Start-Sleep -Milliseconds 500
     if (Test-Path $out) { $res.Html = [string](Get-Content $out -Raw) }
     if (Test-Path $err) { $res.Err += [string](Get-Content $err -Raw) }
@@ -1496,7 +1673,7 @@ function Repair-Firefox($r, $t) {
 function Open-InBrowsers {
     $res = @{ Opened = @(); Missing = @(); Failed = @() }
     foreach ($n in 'Chrome', 'Edge', 'Firefox') {
-        $b = $null; try { $b = Find-Browser $n } catch { Log "find $n failed: $($_.Exception.Message)" }
+        $b = $null; try { $b = Find-Browser $n } catch { Write-DscError $_ 'Caught exception'; Log "find $n failed: $($_.Exception.Message)" }
         if (-not $b) { $res.Missing += $n; continue }
         Say "      Opening isLive in $n ..." 'Cyan'
         if ($TestMode) { Log "OPEN $($b.Exe) $($Cfg.IsLiveUrl)"; $res.Opened += $n; continue }
@@ -1506,14 +1683,14 @@ function Open-InBrowsers {
             try {
                 $p = Start-Process -FilePath "$env:SystemRoot\System32\runas.exe" -ArgumentList ('/trustlevel:0x20000 "\"' + $b.Exe + '\" ' + $Cfg.IsLiveUrl + '"') -PassThru -WindowStyle Hidden -ErrorAction Stop
                 if ($p.WaitForExit(10000) -and $p.ExitCode -eq 0) { $ok = $true }
-            } catch {}
+            } catch { Write-DscError $_ 'Caught exception';}
             if (-not $ok) { Start-Process -FilePath $b.Exe -ArgumentList $Cfg.IsLiveUrl -ErrorAction Stop }
             $res.Opened += $n
-        } catch { Log "open in $n failed: $($_.Exception.Message)"; $res.Failed += $n }
+        } catch { Write-DscError $_ 'Caught exception'; Log "open in $n failed: $($_.Exception.Message)"; $res.Failed += $n }
     }
     if (-not $res.Opened.Count) {
         # none of the three found / started: use the PC's default browser
-        try { if (-not $TestMode) { Start-Process $Cfg.IsLiveUrl -ErrorAction Stop }; $res.Opened += 'default browser' } catch { Log "default browser failed: $($_.Exception.Message)" }
+        try { if (-not $TestMode) { Start-Process $Cfg.IsLiveUrl -ErrorAction Stop }; $res.Opened += 'default browser' } catch { Write-DscError $_ 'Caught exception'; Log "default browser failed: $($_.Exception.Message)" }
     }
     $msg = "Opened in: $(if ($res.Opened.Count) { $res.Opened -join ', ' } else { 'nothing' })"
     if ($res.Missing.Count) { $msg += "   |   not installed (skipped): $($res.Missing -join ', ')" }
@@ -1654,7 +1831,12 @@ function Invoke-AllTests([int[]]$Nos) {
         if ($Nos -and $Nos -notcontains $d.No) { continue }
         if ($script:UiStatus) { & $script:UiStatus "Testing [$($d.No)] $($d.Title) ..." }
         Update-Ui
-        $t = & $d.T; $d.Last = $t
+        try { $t = & $d.T; if ($null -eq $t) { throw 'Diagnostic returned no result.' } }
+        catch {
+            Write-DscError $_ ("Diagnostic check " + $d.No)
+            $t = @{ Pass = $false; Info = @('Diagnostic raised an exception; see events.jsonl.'); Advice = 'Review the local error log before attempting this repair.' }
+        }
+        $d.Last = $t
         $prev = $d.R.Status
         Set-FromTest $d.R $t
         if (-not $d.Tested) {
@@ -1684,9 +1866,11 @@ function Invoke-Fixes([int[]]$nos) {
         $d = $ByNo[$no]; $r = $d.R; $d.Fixed = $true
         if ($script:UiStatus) { & $script:UiStatus "Fixing [$no] $($d.Title) ..." }
         Say ''; Say ("   [{0}] {1}" -f $no, $d.Title) 'White'
-        $t = & $d.T
+        try { $t = & $d.T; if ($null -eq $t) { throw 'Repair precheck returned no result.' } }
+        catch { Write-DscError $_ ("Repair precheck " + $no); $r.Status = 'FAIL'; $r.Advice = 'Repair was skipped because its precheck failed.'; continue }
+        Write-DscEvent 'Info' 'Repair attempted' @{ Check = $no }
         if ($t.Pass -and -not $t.Warn) { Add-Detail $r 'Solved by an earlier fix'; Say '      -> already solved by an earlier fix' 'Cyan' }
-        else { try { & $d.F $r $t } catch { Add-Detail $r "Repair error: $($_.Exception.Message)"; Log $_.ScriptStackTrace } }
+        else { try { & $d.F $r $t } catch { Write-DscError $_ ("Repair check " + $no); $r.Status = 'FAIL'; $r.Advice = $_.Exception.Message; Add-Detail $r "Repair error: $($_.Exception.Message)"; Log $_.ScriptStackTrace } }
         Update-Ui
     }
 }
@@ -1704,6 +1888,7 @@ function Request-Elevation([int[]]$nos, [string]$NextMode) {
 if ($script:Handoff -and $script:Handoff.pkg) { $script:PkgOverride = [string]$script:Handoff.pkg }
 if ($script:Handoff -and $script:Handoff.pkgurl -and -not $Cfg.PackageUrl) { $Cfg.PackageUrl = [string]$script:Handoff.pkgurl; $Cfg.PackageSha256 = [string]$script:Handoff.pkgsha }
 function Save-Results {
+    Save-DscSession $Results
     $rep = Write-Report
     $Results.Values | Select-Object No, Title, Before, BeforeValue, Status, Value, @{n = 'Detail'; e = { $_.Detail -join ' | ' } }, @{n = 'Actions'; e = { $_.Actions -join ' | ' } }, Advice |
         ConvertTo-Json | Set-Content (Join-Path $RunDir 'result.json')
@@ -1859,6 +2044,12 @@ function Start-Console {
         }
     }
     $report = Save-Results
+    Say ("Session logs: " + $script:DscSessionDirectory)
+    if (-not $CheckOnly -and -not $TestMode) {
+        $reportChoice = Ask '   [E] Preview error report   [I] Suggest improvement   [N] Finish : ' @('E','I','N') 'N'
+        if ($reportChoice -eq 'E') { Show-DscGitHubReport }
+        elseif ($reportChoice -eq 'I') { Show-DscGitHubReport -Kind Improvement }
+    }
     Say ''; Say "Report: $report"
     if ($Cfg.OpenReport -and -not $TestMode -and ($bad -or $doFix.Count)) { Start-Process $report }
 }
@@ -1870,7 +2061,7 @@ function New-UiFont([string]$Name, [double]$Size, [switch]$Bold) {
     try {
         if ($Bold) { return New-Object Drawing.Font($Name, [single]$Size, [Drawing.FontStyle]::Bold) }
         return New-Object Drawing.Font($Name, [single]$Size)
-    } catch { return New-Object Drawing.Font('Microsoft Sans Serif', [single]$Size) }
+    } catch { Write-DscError $_ 'Caught exception'; return New-Object Drawing.Font('Microsoft Sans Serif', [single]$Size) }
 }
 function Get-SysColor([string]$Name) {
     if ($env:DSSF_GUISTUB) { if ($Name -eq 'WindowText') { return [Drawing.Color]::Black } else { return [Drawing.Color]::LightGray } }
@@ -1889,12 +2080,12 @@ function Start-Gui {
     # every button / window event runs through this: an error is shown and logged, the window never freezes
     function Invoke-UiSafe([scriptblock]$Body) {
         try { & $Body }
-        catch {
+        catch { Write-DscError $_ 'Caught exception';
             $err = $_
             Log "UI error: $($err.Exception.Message) @ line $($err.InvocationInfo.ScriptLineNumber): $($err.InvocationInfo.Line.Trim())"
-            try { Set-Busy $false } catch {}
-            try { $script:G.Stat.Text = "Error: $($err.Exception.Message)" } catch {}
-            try { [void][Windows.Forms.MessageBox]::Show("Something went wrong:`r`n$($err.Exception.Message)`r`n`r`nThe window still works - click 'Run full check' to try again, or Close.`r`nLog: $LogFile", 'DSC Signer Check & Fix', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) } catch {}
+            try { Set-Busy $false } catch { Write-DscError $_ 'Caught exception';}
+            try { $script:G.Stat.Text = "Error: $($err.Exception.Message)" } catch { Write-DscError $_ 'Caught exception';}
+            try { [void][Windows.Forms.MessageBox]::Show("Something went wrong:`r`n$($err.Exception.Message)`r`n`r`nThe window still works - click 'Run full check' to try again, or Close.`r`nLog: $LogFile", 'DSC Signer Check & Fix', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) } catch { Write-DscError $_ 'Caught exception';}
         }
     }
     $font = (New-UiFont 'Segoe UI' 9.5)
@@ -1921,6 +2112,9 @@ function Start-Gui {
     $bar = New-Object Windows.Forms.FlowLayoutPanel; $bar.Dock = 'Bottom'; $bar.Height = 52; $bar.WrapContents = $true; $bar.AutoSize = $true; $bar.AutoSizeMode = 'GrowAndShrink'; $bar.Padding = New-Object Windows.Forms.Padding(10, 9, 10, 6)
     $bar.BackColor = [Drawing.Color]::FromArgb(244, 246, 249)
     function New-Btn($text, $w) { $b = New-Object Windows.Forms.Button; $b.Text = $text; $b.Width = $w; $b.Height = 32; $b.FlatStyle = 'Standard'; $b.UseVisualStyleBackColor = $true; $b.Margin = New-Object Windows.Forms.Padding(4, 0, 4, 0); return $b }
+    $G.BGitHub = New-Btn 'Report error ...' 130
+    $G.BImprove = New-Btn 'Suggest improvement ...' 165
+    $bar.Controls.AddRange(@($G.BGitHub, $G.BImprove))
     $G.BTest = New-Btn 'Run full check' 115
     $G.BFix = New-Btn 'Fix selected ...' 130
     $G.BLocate = New-Btn 'Locate installer ...' 145
@@ -1942,7 +2136,7 @@ function Start-Gui {
             $G = $script:G; $script:FlashOn = -not $script:FlashOn
             if ($script:FlashOn) { $G.BOpen.BackColor = [Drawing.Color]::FromArgb(255, 140, 0); $G.BOpen.ForeColor = [Drawing.Color]::White; $G.Hand.Margin = New-Object Windows.Forms.Padding(16, 0, 0, 0) }
             else { $G.BOpen.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $G.BOpen.ForeColor = [Drawing.Color]::Black; $G.Hand.Margin = New-Object Windows.Forms.Padding(8, 0, 8, 0) }
-        } catch { try { $script:G.Flash.Stop() } catch {} }
+        } catch { Write-DscError $_ 'Caught exception'; try { $script:G.Flash.Stop() } catch { Write-DscError $_ 'Caught exception';} }
     })
 
     # status strip
@@ -1975,7 +2169,7 @@ function Start-Gui {
     $script:UiStatus = { param($m) $script:G.Stat.Text = $m; [System.Windows.Forms.Application]::DoEvents() }
     $script:UiRow = {
         param($d)
-        try { & $script:UiRowInner $d } catch { Log "row display error [$($d.No)]: $($_.Exception.Message)" }
+        try { & $script:UiRowInner $d } catch { Write-DscError $_ 'Caught exception'; Log "row display error [$($d.No)]: $($_.Exception.Message)" }
     }
     $script:UiRowInner = {
         param($d)
@@ -1994,15 +2188,15 @@ function Start-Gui {
     $script:Ui = $f
     $script:RequestPackage = { return ((Show-PackageDialog "The installer is needed to install DigitalSignerService $($Cfg.DssVersion) - select the zip / msi / folder") -eq 'ok') }
 
-    function Start-Flash { try { $script:G.Hand.Visible = $true; $script:G.Flash.Start() } catch {} }
+    function Start-Flash { try { $script:G.Hand.Visible = $true; $script:G.Flash.Start() } catch { Write-DscError $_ 'Caught exception';} }
     function Stop-Flash {
         try {
             $script:G.Flash.Stop(); $script:G.Hand.Visible = $false
             $script:G.BOpen.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $script:G.BOpen.ForeColor = [Drawing.Color]::Black
-        } catch {}
+        } catch { Write-DscError $_ 'Caught exception';}
     }
     function Set-Busy([bool]$b) {
-        foreach ($k in 'BTest', 'BFix', 'BLocate', 'BOpen', 'BReport', 'BPack') { $script:G[$k].Enabled = -not $b }
+        foreach ($k in 'BTest', 'BFix', 'BLocate', 'BOpen', 'BReport', 'BPack', 'BGitHub', 'BImprove') { $script:G[$k].Enabled = -not $b }
         $script:G.Prog.Visible = $b
         $script:G.Form.Cursor = $(if ($b) { [Windows.Forms.Cursors]::WaitCursor } else { [Windows.Forms.Cursors]::Default })
         [System.Windows.Forms.Application]::DoEvents()
@@ -2018,7 +2212,7 @@ function Start-Gui {
             if ($r.Actions.Count) { $lines += ''; $lines += 'What the tool did:'; $lines += $r.Actions | ForEach-Object { "  -> $_" } }
             if ($r.Status -in 'FAIL', 'SKIP', 'WARN' -and $r.Advice) { $lines += ''; $lines += "Note: $($r.Advice)" }
             $G.LogMode = $false; $G.Txt.Text = ($lines -join "`r`n")
-        } catch { Log "detail panel error: $($_.Exception.Message)" }
+        } catch { Write-DscError $_ 'Caught exception'; Log "detail panel error: $($_.Exception.Message)" }
     }
     function Update-Summary {
         $G = $script:G; $C = $script:GC
@@ -2147,6 +2341,8 @@ function Start-Gui {
     $G.BTest.Add_Click({ Invoke-UiSafe { Invoke-GuiTest -Full; Invoke-InstallerCheckGui; Show-Detail; Show-FixChoice } })
     $G.BClose.Add_Click({ Invoke-UiSafe { $script:G.Form.Close() } })
     $G.BReport.Add_Click({ Invoke-UiSafe { $rp = Save-Results; Start-Process $rp } })
+    $G.BGitHub.Add_Click({ Invoke-UiSafe { Save-DscSession $Results; Show-DscGitHubReport -UseGui } })
+    $G.BImprove.Add_Click({ Invoke-UiSafe { Save-DscSession $Results; Show-DscGitHubReport -Kind Improvement -UseGui } })
     $G.BLocate.Add_Click({ Invoke-UiSafe {
         $res = Show-PackageDialog
         if ($res -eq 'exit') { return }
@@ -2211,7 +2407,7 @@ function Start-Gui {
         $validate = {
             $PD = $script:PkgDlg; $C = $script:GC; $p = $PD.Tb.Text.Trim()
             if ($p -eq '(built into this tool)') { $PD.Valid = $true; $PD.St.Text = 'VALID - installer built into this tool'; $PD.St.ForeColor = $C.Ok; $PD.Ok.Enabled = $true; return }
-            try { $v = Test-PackageValid $p } catch { $v = @{ Ok = $false; Text = "Could not check this location: $($_.Exception.Message)" } }
+            try { $v = Test-PackageValid $p } catch { Write-DscError $_ 'Caught exception'; $v = @{ Ok = $false; Text = "Could not check this location: $($_.Exception.Message)" } }
             $PD.Valid = $v.Ok; $PD.Ok.Enabled = $v.Ok
             if ($v.Ok) { $PD.St.Text = $v.Text; $PD.St.ForeColor = $C.Ok } else { $PD.St.Text = "NOT VALID - $($v.Text)"; $PD.St.ForeColor = $C.Bad }
         }
@@ -2237,7 +2433,7 @@ function Start-Gui {
     }
 
     $f.Add_Shown({ Invoke-UiSafe {
-        try { $script:G.Split.SplitterDistance = [int]($script:G.Split.Height * 0.52) } catch {}
+        try { $script:G.Split.SplitterDistance = [int]($script:G.Split.Height * 0.52) } catch { Write-DscError $_ 'Caught exception';}
         $hand = @(); if ($script:Handoff) { $hand = @($script:Handoff.fix | ForEach-Object { [int]$_ }) }
         if ($hand.Count) {
             $script:G.Sub.Text = "Reopened as administrator to fix: $($hand -join ', ') - testing again first ..."
@@ -2275,10 +2471,11 @@ function Start-Gui {
 
 
     if ($Mode -eq 'gui') { Start-Gui } else { Start-Console }
+    } finally { Save-DscSession $Results }
 }
 function Invoke-DscSelection([string]$Selection) {
     try { Invoke-DscNative $Selection }
-    catch {
+    catch { Write-DscError $_ 'Caught exception';
         Write-Host ('DSC Fix stopped: ' + $_.Exception.Message) -ForegroundColor Red
         Write-Host 'If Trellix or organization policy blocked an action, stop here and share the detection with IT. This tool does not change antivirus settings.' -ForegroundColor Yellow
     }
@@ -2291,14 +2488,26 @@ while ($true) {
     Write-Host '2. DSC Fix - Windows popups'
     Write-Host '3. Back to menu / redraw'
     Write-Host '4. Exit'
+    Write-Host '5. Preview error report / GitHub'
+    Write-Host '6. Suggest improvement / GitHub'
+    Write-Host ('Session logs: ' + $script:DscSessionDirectory)
     Write-Host 'Checks run first. Repairs require your selection and an Administrator session.'
-    $choice = Read-Host 'Choose 1-4'
+    $choice = Read-Host 'Choose 1-6'
     switch ($choice) {
         '1' { Invoke-DscSelection 'console' }
         '2' { Invoke-DscSelection 'gui' }
         '3' { continue }
         '4' { return }
-        default { Write-Host 'Enter 1, 2, 3, or 4.' -ForegroundColor Yellow }
+        '5' { Show-DscGitHubReport }
+        '6' { Show-DscGitHubReport -Kind Improvement }
+        default { Write-Host 'Enter a number from 1 to 6.' -ForegroundColor Yellow }
     }
+}
+} catch {
+    Write-DscError $_ 'Session stopped'
+    Write-Host ('DSC Fix stopped: ' + $_.Exception.Message) -ForegroundColor Red
+} finally {
+    Save-DscSession -State $(if ($script:DscSession.ErrorCount) { 'CompletedWithErrors' } else { 'Completed' })
+    Write-Host ('Session logs: ' + $script:DscSessionDirectory)
 }
 } @args
