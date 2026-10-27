@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Girish Tiwari. All rights reserved.
+# Use is subject to LICENSE.txt. This notice does not conceal source code.
 [CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$SessionDirectory, [ValidateSet('Error','Improvement')][string]$Kind = 'Error', [switch]$Gui)
 if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { throw 'Organization policy restricts this session. Ask IT to review.' }

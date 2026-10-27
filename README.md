@@ -1,4 +1,4 @@
-# DSC-FIXER - Native PowerShell test edition
+# Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )
 
 > Current local build: **2026.10.27.3**. All editions now support permission-based DSS installer downloads. Earlier local-package-only capability notes below are superseded by the Download permission and repository backups section.
 
@@ -19,7 +19,7 @@ This update affects only DSC-FIXER. DSC-FIX and DSC-FIXR remain unchanged.
 
 ---
 
-# DSC-FIXER
+# Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )
 
 ## Session logs and GitHub reports (2026.10.26.1)
 
@@ -94,3 +94,10 @@ Before editing repository sources, always create and verify a timestamped backup
 ## Backup scope clarification (2026.10.27.3)
 
 The user's backup instruction applies only to repository source files before editing. The user-side DSS installation-backup function and prerequisite have been removed from GUI/console editions. Existing archived backups are not deleted. Download permission, automatic validation/mapping and the reviewed installation/repair flow are unchanged. The historical test filename Test-DownloadBackup.ps1 now covers downloads and verifies that installation snapshots are absent. Standard PATH/hosts repair copies remain as before. No commits or pushes were made.
+
+
+## Copyright and publisher signing
+
+Copyright (c) 2026 Girish Tiwari. All rights reserved. See [LICENSE.txt](LICENSE.txt) for permitted use. Source remains readable; these terms are not copy protection. Existing third-party rights remain unchanged.
+
+The scripts remain unsigned pending a code-signing certificate. See [SIGNING.md](SIGNING.md) for the release signing and verification steps. The download-and-evaluate command above does not verify Authenticode signatures.

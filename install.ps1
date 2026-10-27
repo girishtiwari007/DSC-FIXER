@@ -1,5 +1,7 @@
+# Copyright (c) 2026 Girish Tiwari. All rights reserved.
+# Use is subject to LICENSE.txt. This notice does not conceal source code.
 <#
-DSC-FIXER native PowerShell edition.
+Digital Signing Service 4.1.8 Troubleshooter ( for E-Office ) - native PowerShell edition.
 No batch download, self-extraction, encoded payload, automatic elevation, or execution-policy changes.
 Trellix/AMSI and organization policy remain active. If blocked, stop and ask IT to review.
 #>
@@ -193,7 +195,7 @@ else { $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.Wind
 $Cfg = [ordered]@{
     SignerHost          = 'eoffsigner.eoffice.gov.in'
     Port                = 55101
-    EditionName         = 'DSC-FIXER - Native PowerShell / permission-based DSS download'
+    EditionName         = 'Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )'
     DssVersion          = '4.1.8'
     JavaPageUrl         = 'https://www.java.com/en/download/manual.jsp'
     JavaManualUrl       = 'https://www.java.com/en/download/manual.jsp'
@@ -1858,7 +1860,7 @@ ul{margin:8px 0 0;padding-left:20px}li{margin:2px 0}.det{color:var(--mute)}.lbl{
 .act li{color:var(--fx)}.adv{margin-top:10px;background:var(--bdbg);border-radius:8px;padding:8px 12px}
 footer{color:var(--mute);font-size:13px;margin-top:20px}
 </style></head><body><div class="wrap">
-<header><h1>DSC Signer Service &#8212; One Click Check</h1><div class="m">$($Cfg.EditionName) | Build 2026.10.27.3<br>$machine</div></header>
+<header><h1>Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )</h1><div class="m">$($Cfg.EditionName) | Build 2026.10.27.3<br>$machine</div></header>
 <div class="banner $bcls"><div class="mark">$(if($failed -eq 0 -and -not $warns){'&#10004;'}else{'&#9888;'})</div><div><div class="big">$banner</div><div class="sub">$bsub</div></div></div>
 <div class="live"><div class="row"><b>Live browser test:</b><span id="lv">checking&#8230;</span><button onclick="chk()">Test again</button></div>
 <div class="m" style="margin-top:6px"><code>$url</code> &#8212; <a href="$url" target="_blank">open in new tab</a></div></div>
@@ -2230,7 +2232,7 @@ function Start-Console {
     if (-not $TestMode) { Clear-Host }
     Say '=================================================================' 'White'
     Say ("$($Cfg.EditionName) | Build 2026.10.27.3") 'White'
-    Say "  DSC Signer Service $($Cfg.DssVersion) - Check & Fix$(if($CheckOnly){'   [CHECK ONLY]'})$(if($TestMode){'   [TEST MODE]'})" 'White'
+    Say "  Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )$(if($CheckOnly){'   [CHECK ONLY]'})$(if($TestMode){'   [TEST MODE]'})" 'White'
     Say "  Running as: $(if($IsAdmin){'Administrator'}else{'normal user (reopen PowerShell as Administrator for repairs)'})" 'Gray'
     Say '=================================================================' 'White'
     $handFix = @(); if ($script:Handoff) { $handFix = @($script:Handoff.fix | ForEach-Object { [int]$_ }) }
@@ -2316,7 +2318,7 @@ function Start-Gui {
             Log "UI error: $($err.Exception.Message) @ line $($err.InvocationInfo.ScriptLineNumber): $($err.InvocationInfo.Line.Trim())"
             try { Set-Busy $false } catch { Write-DscError $_ 'Caught exception';}
             try { $script:G.Stat.Text = "Error: $($err.Exception.Message)" } catch { Write-DscError $_ 'Caught exception';}
-            try { [void][Windows.Forms.MessageBox]::Show("Something went wrong:`r`n$($err.Exception.Message)`r`n`r`nThe window still works - click 'Run full check' to try again, or Close.`r`nLog: $LogFile", 'DSC Signer Check & Fix', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) } catch { Write-DscError $_ 'Caught exception';}
+            try { [void][Windows.Forms.MessageBox]::Show("Something went wrong:`r`n$($err.Exception.Message)`r`n`r`nThe window still works - click 'Run full check' to try again, or Close.`r`nLog: $LogFile", 'Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) } catch { Write-DscError $_ 'Caught exception';}
         }
     }
     $font = (New-UiFont 'Segoe UI' 9.5)
@@ -2328,8 +2330,8 @@ function Start-Gui {
 
     # header
     $hdr = New-Object Windows.Forms.Panel; $hdr.Dock = 'Top'; $hdr.Height = 74; $hdr.BackColor = $C.Navy
-    $t1 = New-Object Windows.Forms.Label; $t1.UseMnemonic = $false; $t1.Text = 'DSC Signer Service - Check & Fix'; $t1.ForeColor = [Drawing.Color]::White
-    $t1.Font = (New-UiFont 'Segoe UI Semibold' 15); $t1.AutoSize = $true; $t1.Location = New-Object Drawing.Point(16, 8)
+    $t1 = New-Object Windows.Forms.Label; $t1.UseMnemonic = $false; $t1.Text = 'Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )'; $t1.ForeColor = [Drawing.Color]::White
+    $t1.Font = (New-UiFont 'Segoe UI Semibold' 13); $t1.AutoSize = $true; $t1.Location = New-Object Drawing.Point(16, 8)
     $t2 = New-Object Windows.Forms.Label; $t2.ForeColor = [Drawing.Color]::FromArgb(200, 220, 235); $t2.AutoSize = $true; $t2.Location = New-Object Drawing.Point(18, 44)
     $t2.Text = "isLive, installation path, PATH, Java, port, installer preparation and remaining checks   |   $([Environment]::MachineName)   |   $(if ($IsAdmin) { 'Administrator' } else { 'normal user' })"
     $hdr.Controls.AddRange(@($t1, $t2)); $G.Sub = $t2
@@ -2717,49 +2719,69 @@ function Start-Gui {
 function Invoke-DscSelection([string]$Selection) {
     try { Invoke-DscNative $Selection }
     catch { Write-DscError $_ 'Caught exception';
-        Write-Host ('DSC Fix stopped: ' + $_.Exception.Message) -ForegroundColor Red
+        Write-Host ('Digital Signing Service 4.1.8 Troubleshooter ( for E-Office ) stopped: ' + $_.Exception.Message) -ForegroundColor Red
         Write-Host 'If Trellix or organization policy blocked an action, stop here and share the detection with IT. This tool does not change antivirus settings.' -ForegroundColor Yellow
     }
 }
+function Show-DscMenu {
+    $interactive = $Host.Name -eq 'ConsoleHost' -and -not [Console]::IsOutputRedirected
+    $width = 94
+    if ($interactive) {
+        try {
+            $width = [Math]::Max(12, [Math]::Min(94, $Host.UI.RawUI.WindowSize.Width - 1))
+            Clear-Host
+        } catch { }
+    }
+    $inside = $width - 4
+    $rule = '+' + ('-' * ($width - 2)) + '+'
+    function Write-MenuRow([string]$Text = '', [ConsoleColor]$Color = 'Gray', [switch]$Bold) {
+        $rowPrefix = ''; $rowSuffix = ''
+        if ($Bold -and $interactive -and $Host.UI.SupportsVirtualTerminal) {
+            $rowPrefix = [string][char]27 + '[1m'
+            $rowSuffix = [string][char]27 + '[22m'
+        }
+        if (-not $Text.Length) {
+            Write-Host ('| ' + (' ' * $inside) + ' |') -ForegroundColor $Color
+            return
+        }
+        while ($Text.Length -gt $inside) {
+            $split = $Text.LastIndexOf(' ', $inside)
+            if ($split -lt 1) { $split = $inside }
+            Write-Host ($rowPrefix + '| ' + $Text.Substring(0, $split).PadRight($inside) + ' |' + $rowSuffix) -ForegroundColor $Color
+            $Text = $Text.Substring($split).TrimStart()
+        }
+        Write-Host ($rowPrefix + '| ' + $Text.PadRight($inside) + ' |' + $rowSuffix) -ForegroundColor $Color
+    }
+    Write-Host ''
+    Write-Host $rule -ForegroundColor Cyan
+    Write-MenuRow 'Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )' Yellow -Bold
+    Write-MenuRow 'Native PowerShell | Build 2026.10.27.3' White
+    Write-MenuRow
+    Write-MenuRow 'Developed by Girish Tiwari' Gray
+    Write-MenuRow 'Senior Information Technology, Certified Microsoft Engineer' Gray
+    Write-Host $rule -ForegroundColor Cyan
+    Write-MenuRow
+    Write-MenuRow 'Option 1. PowerShell Console Method' Green
+    Write-MenuRow
+    Write-MenuRow 'Option 2. Windows GUI-New Window Console Method' Cyan
+    Write-MenuRow
+    Write-MenuRow 'Option 3. Refresh menu' Yellow
+    Write-MenuRow
+    Write-MenuRow 'Option 4. Exit' Gray
+    Write-MenuRow
+    Write-Host $rule -ForegroundColor Cyan
+    Write-MenuRow 'Checks run first. Review and select repairs before applying.' White
+    Write-MenuRow 'Repairs require an Administrator session.' Gray
+    Write-MenuRow
+    Write-MenuRow ('Session logs: ' + $script:DscSessionDirectory) DarkGray
+    Write-Host $rule -ForegroundColor Cyan
+    Write-Host ''
+}
 if ($Mode -ne 'menu') { Invoke-DscSelection $Mode; return }
 while ($true) {
-    Write-Host ''
-    Write-Host 'DSC-FIXER - Native PowerShell | Build 2026.10.27.3' -ForegroundColor Cyan
-    Write-Host 'Developed by Girish Tiwari - Senior Information Technology, Certified Microsoft Engineer' -ForegroundColor Gray
-    Write-Host ''
-    Write-Host ''
-    Write-Host '  1. PowerShell Console Method' -ForegroundColor Green
-    Write-Host ''
-    Write-Host '  2. Windows GUI-New Window Console Method' -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host '  3. Refresh menu' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  4. Exit' -ForegroundColor Gray
-    Write-Host ''
-    Write-Host ('Session logs: ' + $script:DscSessionDirectory)
-    Write-Host 'Checks run first. Repairs require your selection and an Administrator session.'
+    Show-DscMenu
     $menuInstruction = 'Select any one option to proceed further (1-4):'
-    # Do not consume the first key: Read-Host must receive the user's selection.
-    $canFlash = $Host.Name -eq 'ConsoleHost' -and -not [Console]::IsOutputRedirected -and -not [Console]::IsInputRedirected
-    if ($canFlash) {
-        try {
-            $highlight = $true
-            while (-not [Console]::KeyAvailable) {
-                if ($highlight) {
-                    Write-Host ("`r" + $menuInstruction) -NoNewline -ForegroundColor Black -BackgroundColor Yellow
-                } else {
-                    Write-Host ("`r" + (' ' * $menuInstruction.Length)) -NoNewline
-                }
-                $highlight = -not $highlight
-                Start-Sleep -Milliseconds 400
-            }
-        } catch {
-            # Hosts without console keyboard support use the normal prompt.
-        }
-        Write-Host ("`r" + $menuInstruction) -ForegroundColor Yellow
-    } else {
-        Write-Host $menuInstruction -ForegroundColor Yellow
-    }
+    Write-Host $menuInstruction -ForegroundColor Black -BackgroundColor Yellow
     $choice = Read-Host 'Choose 1-4'
     switch ($choice) {
         '1' { Invoke-DscSelection 'console' }
@@ -2771,7 +2793,7 @@ while ($true) {
 }
 } catch {
     Write-DscError $_ 'Session stopped'
-    Write-Host ('DSC Fix stopped: ' + $_.Exception.Message) -ForegroundColor Red
+    Write-Host ('Digital Signing Service 4.1.8 Troubleshooter ( for E-Office ) stopped: ' + $_.Exception.Message) -ForegroundColor Red
 } finally {
     Save-DscSession -State $(if ($script:DscSession.ErrorCount) { 'CompletedWithErrors' } else { 'Completed' })
     Write-Host ('Session logs: ' + $script:DscSessionDirectory)
