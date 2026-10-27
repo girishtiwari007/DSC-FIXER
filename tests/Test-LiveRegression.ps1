@@ -11,7 +11,7 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
  if(-not $has){continue}
  & {
   param($ast,$source,$label,$fixtureRoot)
-  foreach($name in 'Get-DscOverallState','Get-Failed','Get-Fixable','Invoke-JavaVersion','Wait-Proc','Test-ChromiumBrowser','Test-DscLiveResponse','Set-FromTest','New-Result','Get-Label','New-UiFont','Get-SysColor'){
+  foreach($name in 'Get-DscFindingsSummary','Request-ConsoleReview','Get-DscOverallState','Get-Failed','Get-Fixable','Invoke-JavaVersion','Wait-Proc','Test-ChromiumBrowser','Test-DscLiveResponse','Set-FromTest','New-Result','Get-Label','New-UiFont','Get-SysColor'){
    . ([scriptblock]::Create((Read-LiveFunction $ast $name)))
   }
   function Update-Ui {}
@@ -67,7 +67,7 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
         $index++;Assert-Live ($G.List.Items[$index-1].Text -eq [string]$index) ('visible check number '+$index)
     }
     Update-Summary
-    Assert-Live ($G.Live.Text.StartsWith('WORKING')) 'actual GUI banner respects isLive success despite other failures'
+    Assert-Live ($G.Live.Text.StartsWith('Signer service: WORKING')) 'actual GUI banner respects isLive success despite other failures'
     $G.JavaTimer.Dispose();$G.Flash.Dispose();$f.Dispose()
 '@)
   . ([scriptblock]::Create($gui))

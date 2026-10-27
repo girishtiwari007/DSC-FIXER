@@ -40,7 +40,7 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
         Assert-Workflow (-not [DssfHttpV3]::IsExpiryOnly($url,$chainError,$timeOnly,[DateTime[]]@($now.AddDays(1)),[DateTime[]]@($now.AddYears(1)),$now)) "$label future certificates are rejected"
         Assert-Workflow ($source.Contains('q.AllowAutoRedirect = false')) "$label expiry permission is not carried through redirects"
         Assert-Workflow ($source -notmatch '--ignore-certificate-errors') "$label does not disable browser certificate validation"
-        foreach($name in 'Get-DscOverallState','Test-DscLiveResponse','Test-IsLive','Test-JavaLatest','Update-JavaOffer','Invoke-OptionalJavaUpdate','Prepare-DscInstaller','Get-DssPackageFromWeb','Invoke-StartupSequence','Start-Console','Invoke-GuiTest') {
+        foreach($name in 'Get-DscFindingsSummary','Request-ConsoleReview','Get-DscOverallState','Get-DssSha256','Test-DscLiveResponse','Test-IsLive','Test-JavaLatest','Update-JavaOffer','Invoke-OptionalJavaUpdate','Prepare-DscInstaller','Get-DssPackageFromWeb','Invoke-StartupSequence','Start-Console','Invoke-GuiTest') {
             . ([scriptblock]::Create((Read-WorkflowFunction $ast $name)))
         }
         $Cfg=@{DssVersion='4.1.8';IsLiveUrl=$url;OpenReport=$false;AllowDssDownload=$false;PackageUrl='';PackageSha256=''}
@@ -83,7 +83,7 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
         Assert-Workflow (-not $script:JavaUpdateOffer.Available -and $script:UpdateFetches -eq 0) "$label broken Java does not offer an optional upgrade first"
 
         # Package preparation and download capability tests; files contain fixture bytes only.
-        $CheckOnly=$false;$script:Results=@{'3'=@{Status='FAIL'}}
+        $CheckOnly=$false;$script:DiagnosticsOnly=$false;$script:Results=@{'3'=@{Status='FAIL'}}
         $script:PackageReads=0;$script:Downloads=0;$script:SourcePresent=$false;$script:ValidPackage=$true
         function Add-Detail {param($r,$text)}
         function Find-DssPackageSource {$script:PackageReads++;if($script:SourcePresent){@{Kind='msi';Path='fixture.msi'}}}
@@ -99,6 +99,7 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
         $Results['3'].Status='OK';$script:PackageReads=0
         Assert-Workflow (-not (Prepare-DscInstaller) -and $script:PackageReads -eq 0) "$label working installation needs no package"
         function Get-DownloadsFolder {Join-Path $fixtureRoot 'Downloads'}
+        function Confirm-DssDownload {return $true}
         function Get-WebFileResume {param($url,$outFile)$script:Downloads++;[IO.File]::WriteAllText($outFile,'fixture package');@{Ok=$true}}
         function Test-PackagePath {param($p)@{Kind='zip';Path=$p;Version='4.1.8'}}
         function Get-FileHash {param($LiteralPath,$Algorithm)$sha=[Security.Cryptography.SHA256]::Create();try{@{Hash=[BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($LiteralPath))).Replace('-','')}}finally{$sha.Dispose()}}
@@ -116,8 +117,8 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
         $Cfg.PackageSha256='';$script:ValidPackage=$false;$threw=$false
         try{[void](Get-DssPackageFromWeb)}catch{$threw=$true}
         Assert-Workflow $threw "$label downloaded content validation is mandatory"
-        $expectedDownload=($directory -eq 'DSC-FIXR' -and $label.EndsWith('.bat'))
-        Assert-Workflow ($source.Contains('AllowDssDownload    = $'+$expectedDownload.ToString().ToLowerInvariant())) "$label retains the intended DSS download capability"
+        $expectedDownload=$true
+        Assert-Workflow ($source.Contains('AllowDssDownload    = $'+$expectedDownload.ToString().ToLowerInvariant())) "$label offers permission-based DSS downloads"
         Assert-Workflow ($source.Contains('if ($Cfg.AllowDssDownload -and $env:DSSF_PKGURL)')) "$label inherited URL cannot enable an unsupported download"
         Assert-Workflow ($source.Contains("`$Cfg.RequiredDssPath = 'C:\Program Files\Digital Signer Service\4.1.8\Digital Signer Service.exe'")) "$label checks the required Program Files path"
         Assert-Workflow ($source.Contains('another installation at') -and -not $source.Contains('$installed = $true; $exe = $other')) "$label alternate path does not count as the required installation"
@@ -151,7 +152,7 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
         $TestMode=$true;$CheckOnly=$false;$IsAdmin=$false;$script:Handoff=$null
         Reset-WorkflowFixture $true
         Start-Console
-        Assert-Workflow (($script:Trace -join ',') -eq ($expected+',installer-choice,save')) "$label console continues after healthy isLive"
+        Assert-Workflow (($script:Trace -join ',') -eq ($expected+',save')) "$label console continues after healthy isLive"
         Reset-WorkflowFixture $true;$CheckOnly=$true
         Start-Console
         Assert-Workflow (($script:Trace -join ',') -eq (($expected -replace '^browser,','')+',save')) "$label check-only has no browser or installer prompts"

@@ -13,7 +13,7 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
 # Session logging is embedded so each published entry point remains self-contained.
 function Initialize-DscSession([string]$Repository, [string]$ModeName) {
     $script:DscSession = [ordered]@{
-        Schema = 1; ToolVersion = '2026.10.26.4'; Repository = $Repository
+        Schema = 1; ToolVersion = '2026.10.27.3'; Repository = $Repository
         SessionId = [guid]::NewGuid().ToString('N'); StartedUtc = [DateTime]::UtcNow.ToString('o')
         UpdatedUtc = ''; Mode = $ModeName; PowerShell = $PSVersionTable.PSVersion.ToString()
         State = 'Running'; ErrorCount = 0; Checks = @(); Improvements = @()
@@ -193,6 +193,7 @@ else { $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.Wind
 $Cfg = [ordered]@{
     SignerHost          = 'eoffsigner.eoffice.gov.in'
     Port                = 55101
+    EditionName         = 'DSC-FIXER - Native PowerShell / permission-based DSS download'
     DssVersion          = '4.1.8'
     JavaPageUrl         = 'https://www.java.com/en/download/manual.jsp'
     JavaManualUrl       = 'https://www.java.com/en/download/manual.jsp'
@@ -205,15 +206,20 @@ $Cfg = [ordered]@{
     StartWaitSeconds    = 60
     OpenReport          = $true
     # optional: where to download the 4.1.8 installer zip if it is not on this PC (set by install.ps1 / GitHub)
-    AllowDssDownload    = $false
-    PackageUrl          = ''
+    AllowDssDownload    = $true
+    PackageUrl          = 'https://nr.indianrailways.gov.in/uploads/files/1792736602773-DSC_Signer_Tool_with_DSS_4.1.8.zip'
     PackageSha256       = ''
 }
 # where DigitalSignerService 4.1.8 lives on a normal install - checked FIRST for item 3
+$script:DiagnosticsOnly=$true
+$script:ReviewApproved=$false
+$script:DscSession['Edition']=$Cfg.EditionName
 $Cfg.RequiredDssPath = 'C:\Program Files\Digital Signer Service\4.1.8\Digital Signer Service.exe'
 $Cfg.DssExePaths = @($Cfg.RequiredDssPath)
 if ($Cfg.AllowDssDownload -and $env:DSSF_PKGURL) { $Cfg.PackageUrl = $env:DSSF_PKGURL }
 if ($env:DSSF_PKGSHA256) { $Cfg.PackageSha256 = $env:DSSF_PKGSHA256 }
+if($env:DSSF_NO_PACKAGE -eq '1'){$Cfg.AllowDssDownload=$false;$Cfg.PackageUrl=''}
+$script:DssDownloadConsent='NotAsked';$script:DssDownloadConsentKey=''
 
 # ---------------------------------------------------------------- test harness hooks
 $StateFile = $null
@@ -760,6 +766,7 @@ function Export-BatPayload([string]$Bat, [string]$OutZip) {
 # Accepts a zip that holds the msi, OR a zip that holds the single-file tool (.bat with the installer inside).
 function Get-DssPackageFromWeb {
     if (-not $Cfg.AllowDssDownload -or -not $Cfg.PackageUrl) { return $false }
+    if(-not (Confirm-DssDownload)){return $false}
     $downloadDir = Join-Path (Get-DownloadsFolder) 'DSC-Signer-4.1.8'
     [void][IO.Directory]::CreateDirectory($downloadDir)
     $zip = Join-Path $downloadDir ('DSS-4.1.8-' + $script:DscSession.SessionId + '.zip')
@@ -770,17 +777,17 @@ function Get-DssPackageFromWeb {
         if (-not $r.Ok) { Say "      Download failed: $($r.Text)" 'Red'; Say "      Use 'Locate installer' to pick the zip / msi if you have it on this PC or a pen drive." 'Yellow'; return $false }
     }
     if ($Cfg.PackageSha256) {
-        $h = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+        $h = Get-DssSha256 $zip
         if ($h -ne $Cfg.PackageSha256.ToUpper()) { Move-Item -LiteralPath $zip -Destination ($zip + '.rejected') -Force -ErrorAction Stop; throw 'Installer package SHA256 mismatch. Archive quarantined with .rejected extension.' }
     }
     $x = Test-PackagePath $zip
     if (-not $x) {
-        $dir = Join-Path $RunDir 'web-package'
-        try { Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force } catch { Write-DscError $_ 'Caught exception'; Say "      The download is not a usable zip: $($_.Exception.Message)" 'Red'; return $false }
+        $dir = Join-Path $RunDir ('web-package-'+[guid]::NewGuid().ToString('N'))
+        try { Expand-DssArchive -LiteralPath $zip -DestinationPath $dir -Force } catch { Write-DscError $_ 'Caught exception'; Say "      The download is not a usable zip: $($_.Exception.Message)" 'Red'; return $false }
         if (-not (Find-InFolder $dir)) {
             foreach ($bat in @(Get-ChildItem -LiteralPath $dir -Recurse -File -Filter *.bat | Where-Object { $_.Length -gt 1MB })) {
                 $pz = Join-Path $dir 'payload.zip'
-                if (Export-BatPayload $bat.FullName $pz) { Expand-Archive -LiteralPath $pz -DestinationPath (Join-Path $dir 'payload') -Force; Remove-Item -LiteralPath $pz -Force; break }
+                if (Export-BatPayload $bat.FullName $pz) { Expand-DssArchive -LiteralPath $pz -DestinationPath (Join-Path $dir 'payload') -Force; Remove-Item -LiteralPath $pz -Force; break }
             }
         }
         $m = Find-InFolder $dir
@@ -794,28 +801,41 @@ function Get-DssPackageFromWeb {
     return $true
 }
 function Get-DssPackageMsi {
-    if ($script:PkgMsi -and (Test-Path -LiteralPath $script:PkgMsi)) { return $script:PkgMsi }
-    $src = Find-DssPackageSource
-    if (-not $src -and (Get-DssPackageFromWeb)) { $src = Find-DssPackageSource }
-    if (-not $src) { return $null }
-    $zip = $null
-    switch ($src.Kind) {
-        'msi' { $script:PkgMsi = $src.Path; return $src.Path }
-        'zip' { $zip = $src.Path }
+    if($script:PkgMsi -and (Test-Path -LiteralPath $script:PkgMsi)){
+        $cached=Test-PackageValid $script:PkgMsi
+        if($cached.Ok){return $script:PkgMsi}
+        $script:PkgMsi=$null
+    }
+    $source=Find-DssPackageSource
+    if($source -and $source.Kind -in 'msi','zip'){
+        $existing=Test-PackageValid $source.Path
+        if(-not $existing.Ok){Log ('Existing package ignored: '+$existing.Text);$source=$null;$script:PkgOverride=$null}
+    }
+    if(-not $source -and (Get-DssPackageFromWeb)){$source=Find-DssPackageSource}
+    if(-not $source){return $null}
+    $candidate=$null;$zip=$null
+    switch($source.Kind){
+        'msi' {$candidate=$source.Path}
+        'zip' {$zip=$source.Path}
         'embedded' {
-            $pi = Get-PayloadInfo $SelfPath
-            $zip = Join-Path $RunDir 'embedded-DSS-package.zip'
-            Say '      Unpacking the installer built into this tool ...'
-            $in = [IO.File]::OpenRead($SelfPath); $out = [IO.File]::Create($zip)
-            try { [void]$in.Seek($pi.DataStart, 'Begin'); $in.CopyTo($out) } finally { $in.Close(); $out.Close() }
+            $payload=Get-PayloadInfo $SelfPath
+            $zip=Join-Path $RunDir 'embedded-DSS-package.zip'
+            $inputFile=[IO.File]::OpenRead($SelfPath);$outputFile=[IO.File]::Create($zip)
+            try{[void]$inputFile.Seek($payload.DataStart,'Begin');$inputFile.CopyTo($outputFile)}finally{$inputFile.Dispose();$outputFile.Dispose()}
         }
     }
-    $dest = Join-Path $RunDir 'pkg'
-    Say "      Unpacking $(Split-Path -Leaf $zip) ..."
-    try { Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force } catch { Write-DscError $_ 'Caught exception'; Log "unzip failed: $_"; return $null }
-    $x = Find-InFolder $dest
-    if ($x -and $x.Kind -eq 'msi') { $script:PkgMsi = $x.Path; return $x.Path }
-    return $null
+    if($zip){
+        $destination=Join-Path $RunDir ('mapped-package-'+[guid]::NewGuid().ToString('N'))
+        Expand-DssArchive -LiteralPath $zip -DestinationPath $destination -Force
+        $found=Find-InFolder $destination
+        if($found -and $found.Kind -eq 'msi'){$candidate=$found.Path}
+    }
+    if(-not $candidate){throw 'No DSS 4.1.8 MSI could be mapped from the package.'}
+    $validation=Test-PackageValid $candidate
+    if(-not $validation.Ok){throw ('Mapped MSI failed validation: '+$validation.Text)}
+    $script:PkgMsi=$candidate
+    Write-DscEvent 'Info' 'DSS MSI mapped and validated' @{Path=$candidate}
+    return $candidate
 }
 # validate a chosen zip / msi / folder: it must contain the Digital Signer Service 4.1.8 msi
 function Test-PackageValid([string]$p) {
@@ -1301,8 +1321,8 @@ function Repair-DssInstall($r, $t, [switch]$ForceRepair) {
     if (-not $t) { $t = Test-DssInstall }
     # Secure and validate the replacement BEFORE stopping or removing anything.
     $msi = Get-DssPackageMsi
-    if (-not $msi -and $script:RequestPackage) { if (& $script:RequestPackage) { $msi = Get-DssPackageMsi } }
-    if (-not $msi) { throw "Installer package $($Cfg.DssVersion) is unavailable; DSS was not stopped or uninstalled." }
+    if (-not $msi -and $script:RequestPackage -and (-not $Cfg.AllowDssDownload -or -not $Cfg.PackageUrl)) { if (& $script:RequestPackage) { $msi = Get-DssPackageMsi } }
+    if (-not $msi) { throw "No approved, validated $($Cfg.DssVersion) installer is ready. A declined or failed download leaves DSS unchanged; no stop or uninstall was started." }
     $valid = Test-PackageValid $msi
     if (-not $valid.Ok) { throw "Replacement installer rejected: $($valid.Text). DSS was not stopped or uninstalled." }
     Stop-Dss $r
@@ -1400,6 +1420,7 @@ function Open-StartupBrowser {
     }
 }
 function Invoke-StartupSequence([switch]$OpenBrowser, [switch]$FullCheck) {
+    $script:DiagnosticsOnly=$true; $script:ReviewApproved=$false
     # Read-only checks and package preparation first; selected repairs happen afterwards.
     Say ''; Say 'STEP 1 - Open isLive and check success for DigitalSignerService 4.1.8.' 'White'
     $opened = $false
@@ -1792,7 +1813,8 @@ function Write-Report {
     $fixed = @($all | Where-Object { $_.Status -eq 'FIXED' }).Count
     $warns = @($all | Where-Object { $_.Status -eq 'WARN' }).Count
     $state=Get-DscOverallState
-    $banner=$state.Title; $bsub=$state.Detail
+    $findings=Get-DscFindingsSummary
+    $banner="Signer service: " + $state.Title; $bsub=$findings.Text
     $bcls=$(if($state.Working){'ok'}elseif(-not $state.Verified){'wn'}else{'bad'})
     $cards = ''; $rows = ''
     foreach ($r in $all) {
@@ -1807,7 +1829,7 @@ function Write-Report {
     $url = $Cfg.IsLiveUrl; $ver = $Cfg.DssVersion
     $html = @"
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DSC Signer Check</title>
+<title>DSC Signer Check | Build 2026.10.27.3</title>
 <style>
 :root{--bg:#f4f6f9;--card:#fff;--ink:#16202c;--mute:#5d6b7a;--ok:#13804a;--okbg:#e6f6ed;--fx:#0b6aa6;--fxbg:#e5f1fa;--wn:#9a6400;--wnbg:#fdf3e1;--bd:#c62828;--bdbg:#fdeaea;--line:#e2e7ee}
 @media (prefers-color-scheme:dark){:root{--bg:#0f141a;--card:#18202a;--ink:#e8edf3;--mute:#9aa8b6;--okbg:#123222;--fxbg:#10283a;--wnbg:#33280f;--bdbg:#3a1616;--line:#26313d;--ok:#4cc38a;--fx:#5fb3ec;--wn:#e3b04b;--bd:#ff6b6b}}
@@ -1836,7 +1858,7 @@ ul{margin:8px 0 0;padding-left:20px}li{margin:2px 0}.det{color:var(--mute)}.lbl{
 .act li{color:var(--fx)}.adv{margin-top:10px;background:var(--bdbg);border-radius:8px;padding:8px 12px}
 footer{color:var(--mute);font-size:13px;margin-top:20px}
 </style></head><body><div class="wrap">
-<header><h1>DSC Signer Service &#8212; One Click Check</h1><div class="m">$machine</div></header>
+<header><h1>DSC Signer Service &#8212; One Click Check</h1><div class="m">$($Cfg.EditionName) | Build 2026.10.27.3<br>$machine</div></header>
 <div class="banner $bcls"><div class="mark">$(if($failed -eq 0 -and -not $warns){'&#10004;'}else{'&#9888;'})</div><div><div class="big">$banner</div><div class="sub">$bsub</div></div></div>
 <div class="live"><div class="row"><b>Live browser test:</b><span id="lv">checking&#8230;</span><button onclick="chk()">Test again</button></div>
 <div class="m" style="margin-top:6px"><code>$url</code> &#8212; <a href="$url" target="_blank">open in new tab</a></div></div>
@@ -1887,6 +1909,10 @@ function Invoke-OptionalJavaUpdate([switch]$Confirmed) {
 }
 
 function Prepare-DscInstaller {
+    if($script:DiagnosticsOnly){
+        if($Results['3'].Status -in 'FAIL','SKIP'){Add-Detail $Results['3'] 'Installer preparation is deferred until Review proposed fixes.'}
+        return $false
+    }
     if ($Results['3'].Status -notin 'FAIL','SKIP') { return $false }
     if ($CheckOnly) { Add-Detail $Results['3'] 'Installer download/preparation deferred in check-only mode.'; return $false }
     try {
@@ -1925,7 +1951,7 @@ function Get-DscOverallState {
     if ($live.Status -in 'OK','FIXED','WARN') {
         $detail="isLive success. $failures additional check(s) need attention; $warnings warning(s)."
         if($definition.Last.ExpiredAccepted){$detail+=' The signer expiry alert is accepted.'}
-        return @{Working=$true;Verified=$true;Title=$(if($failures -or $warnings){'WORKING - WITH NOTICES'}else{'WORKING'});Detail=$detail;Failures=$failures;Warnings=$warnings}
+        return @{Working=$true;Verified=$true;Title=$(if($definition.Last.ExpiredAccepted){'WORKING - EXPIRY ACCEPTED'}else{'WORKING'});Detail=$detail;Failures=$failures;Warnings=$warnings}
     }
     return @{Working=$false;Verified=$true;Title='isLive NOT WORKING';Detail='The isLive request did not return the required success response. Review the results below.';Failures=$failures;Warnings=$warnings}
 }
@@ -1943,6 +1969,109 @@ function Invoke-JavaVersion([string]$File) {
         if(-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),3000)){return @{Code=-1;Text='Java output did not close.'}}
         return @{Code=$process.ExitCode;Text=($stdout.Result+' '+$stderr.Result).Trim()}
     } finally {$process.Dispose()}
+}
+
+function Get-DscFindingsSummary {
+    $others=@($Defs | Where-Object {$_.No -ne 4})
+    $failed=@($others | Where-Object {$_.R.Status -in 'FAIL','SKIP'}).Count
+    $unverified=@($others | Where-Object {$_.Last.DiagnosticError -or $_.Last.Inconclusive -or ($_.R.Status -eq 'WARN' -and $_.Last.BrowserVerified -eq $false)}).Count
+    $warnings=@($others | Where-Object {$_.R.Status -eq 'WARN'}).Count
+    $pending=@($others | Where-Object {$_.R.Status -in 'PENDING','NOTRUN'}).Count
+    return @{Failures=$failed;Warnings=$warnings;Unverified=$unverified;Pending=$pending;Text="Other checks: $failed need attention | $warnings warnings ($unverified unverified) | $pending not checked"}
+}
+function Request-ConsoleReview($Fixable) {
+    if($CheckOnly -or -not @($Fixable).Count){return @()}
+    Say 'Diagnostics finished. No repairs have been applied.' 'White'
+    if((Ask '   [R] Review proposed fixes   [N] Finish without repairs : ' @('R','N') 'N') -ne 'R'){return @()}
+    $script:DiagnosticsOnly=$false
+    $script:DssDownloadConsent='NotAsked';$script:DssDownloadConsentKey=''
+    try {
+        [void](Prepare-DscInstaller)
+        Invoke-InstallerCheckConsole
+        Show-Fixable $Fixable
+        $answer=Ask '   Apply reviewed fixes? [A] All listed   [S] Select individually   [N] Cancel : ' @('A','S','N') 'N'
+        if($answer -eq 'A'){return @($Fixable | ForEach-Object {$_.No})}
+        $selected=@()
+        if($answer -eq 'S'){
+            foreach($definition in $Fixable){if((Ask ("   Apply [{0}] {1}? [Y/N] : " -f $definition.DisplayNo,$definition.Title) @('Y','N') 'N') -eq 'Y'){$selected+=$definition.No}}
+        }
+        return $selected
+    } finally {$script:DiagnosticsOnly=$true}
+}
+
+function Read-DssDownloadApproval([string]$Message) {
+    if($Mode -eq 'gui') {
+        return ([Windows.Forms.MessageBox]::Show($Message,'Permission to download DSS 4.1.8',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Question,[Windows.Forms.MessageBoxDefaultButton]::Button2) -eq 'Yes')
+    }
+    Say $Message 'Yellow'
+    return ((Ask '   Download DSS 4.1.8 now? [Y/N] : ' @('Y','N') 'N') -eq 'Y')
+}
+function Get-DssSha256([string]$LiteralPath) {
+    $hash=[Security.Cryptography.SHA256]::Create()
+    $file=[IO.File]::Open($LiteralPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+    try{return [BitConverter]::ToString($hash.ComputeHash($file)).Replace('-','')}
+    finally{$file.Dispose();$hash.Dispose()}
+}
+function Confirm-DssDownload {
+    if($CheckOnly -or ($script:DiagnosticsOnly -and -not $script:ReviewApproved)){return $false}
+    if(-not $Cfg.AllowDssDownload -or -not $Cfg.PackageUrl){return $false}
+    $key="$($Cfg.DssVersion)|$($Cfg.PackageUrl)|$($Cfg.PackageSha256)"
+    if($script:DssDownloadConsentKey -eq $key -and $script:DssDownloadConsent -eq 'Granted'){return $true}
+    if($script:DssDownloadConsentKey -eq $key -and $script:DssDownloadConsent -eq 'Declined'){return $false}
+    $script:DssDownloadConsentKey=$key
+    $message="Download DigitalSignerService $($Cfg.DssVersion) (about 100 MB)?`r`nSource: $($Cfg.PackageUrl)`r`nThe package will be saved under your Downloads folder, validated and mapped automatically. Downloading does not install it. Installation still requires your reviewed Apply action."
+    $approved=Read-DssDownloadApproval $message
+    $script:DssDownloadConsent=$(if($approved){'Granted'}else{'Declined'})
+    Write-DscEvent 'Info' 'DSS download permission' @{Approved=[bool]$approved;Source=$Cfg.PackageUrl}
+    return [bool]$approved
+}
+function Start-DssPackageRequest {
+    # Called only by an explicit Get installer / package action, never diagnostics.
+    if($CheckOnly){return $false}
+    $previous=$script:DiagnosticsOnly
+    $script:DiagnosticsOnly=$false
+    $script:DssDownloadConsent='NotAsked';$script:DssDownloadConsentKey=''
+    try {
+        $msi=Get-DssPackageMsi
+        if(-not $msi){return $false}
+        $valid=Test-PackageValid $msi
+        if(-not $valid.Ok){throw ('Installer mapping rejected: '+$valid.Text)}
+        $script:PkgMsi=$msi
+        Say ('Installer validated and mapped: '+$msi) 'Green'
+        return $true
+    } finally {$script:DiagnosticsOnly=$previous}
+}
+function Expand-DssArchive([string]$LiteralPath,[string]$DestinationPath,[switch]$Force) {
+    # Use the framework ZIP reader; never change execution policy to load an archive module.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $root=[IO.Path]::GetFullPath($DestinationPath).TrimEnd('\')
+    [void][IO.Directory]::CreateDirectory($root)
+    if((Get-Item -LiteralPath $root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Archive destination is linked.'}
+    $prefix=$root+'\';$archive=[IO.Compression.ZipFile]::OpenRead($LiteralPath)
+    try {
+        if($archive.Entries.Count -gt 10000){throw 'Too many archive entries.'}
+        [long]$total=0
+        foreach($entry in $archive.Entries){
+            $total+=$entry.Length
+            if($total -gt 2GB){throw 'Installer archive exceeds the extraction limit.'}
+            if((($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000){throw 'Linked archive entries are not supported.'}
+            $target=[IO.Path]::GetFullPath((Join-Path $root $entry.FullName))
+            if(-not $target.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)){throw 'Installer archive contains an unsafe path.'}
+            $parent=Split-Path -Parent $target
+            $check=$parent
+            while($check -and $check.Length -ge $root.Length){
+                if((Test-Path -LiteralPath $check) -and ((Get-Item -LiteralPath $check -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Archive path contains a linked directory.'}
+                if($check -eq $root){break};$check=Split-Path -Parent $check
+            }
+            if(-not $entry.Name){[void][IO.Directory]::CreateDirectory($target);continue}
+            [void][IO.Directory]::CreateDirectory($parent)
+            if((Test-Path -LiteralPath $target) -and -not $Force){throw 'Duplicate archive destination.'}
+            if((Test-Path -LiteralPath $target) -and ((Get-Item -LiteralPath $target -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Archive target is linked.'}
+            $inputFile=$null;$outputFile=$null
+            try{$inputFile=$entry.Open();$outputFile=[IO.File]::Open($target,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None);$inputFile.CopyTo($outputFile)}
+            finally{if($inputFile){$inputFile.Dispose()};if($outputFile){$outputFile.Dispose()}}
+        }
+    } finally {$archive.Dispose()}
 }
 
 $Defs = @(
@@ -1997,6 +2126,7 @@ function Set-NotNeeded {
     foreach ($d in $Defs) { if (-not $d.Tested) { $d.R.Status = 'NOTRUN'; $d.R.Value = 'not needed - secure isLive success'; if ($script:UiRow) { & $script:UiRow $d } } }
 }
 function Invoke-Fixes([int[]]$nos) {
+    if(-not $script:ReviewApproved){throw 'Review proposed fixes and explicitly apply them before running repairs.'}
     foreach ($no in $FixOrder) {
         if ($nos -notcontains $no) { continue }
         $d = $ByNo[$no]; $r = $d.R; $d.Fixed = $true
@@ -2022,7 +2152,8 @@ function Request-Elevation([int[]]$nos, [string]$NextMode) {
     return $false
 }
 if ($script:Handoff -and $script:Handoff.pkg) { $script:PkgOverride = [string]$script:Handoff.pkg }
-if ($Cfg.AllowDssDownload -and $script:Handoff -and $script:Handoff.pkgurl -and -not $Cfg.PackageUrl) { $Cfg.PackageUrl = [string]$script:Handoff.pkgurl; $Cfg.PackageSha256 = [string]$script:Handoff.pkgsha }
+if ($Cfg.AllowDssDownload -and $script:Handoff -and $script:Handoff.pkgurl) { $Cfg.PackageUrl = [string]$script:Handoff.pkgurl; $Cfg.PackageSha256 = [string]$script:Handoff.pkgsha }
+if($script:Handoff -and $script:Handoff.nopackage){$Cfg.AllowDssDownload=$false;$Cfg.PackageUrl=''}
 function Save-Results {
     Save-DscSession $Results
     $rep = Write-Report
@@ -2072,9 +2203,12 @@ function Request-PackageStart {
     $script:PkgAsked = $true
     return ((Select-PackageConsole "Select the DigitalSignerService $ver installer package (zip / msi / folder) - it is linked for the fix:" -Start) -ne 'exit')
 }
-function Request-PackageConsole { return ((Select-PackageConsole "The DigitalSignerService $($Cfg.DssVersion) installer is needed to install the Signer Service - select it:") -eq 'ok') }
+function Request-PackageConsole {
+    if($Cfg.AllowDssDownload -and $Cfg.PackageUrl){return (Start-DssPackageRequest)}
+    return ((Select-PackageConsole "The DigitalSignerService $($Cfg.DssVersion) installer is needed to install the Signer Service - select it:") -eq 'ok') }
 # DSS 4.1.8 not installed: say it in red and ask for the installer, then test row 3 again
 function Invoke-InstallerCheckConsole {
+    if($Cfg.AllowDssDownload -and $Cfg.PackageUrl){return}
     $d3 = $ByNo[3]
     if (-not $d3.Tested -or $d3.R.Status -notin 'FAIL', 'SKIP' -or -not $d3.Last.NotInstalled) { return }
     Say ''; Say "   DigitalSignerService $($Cfg.DssVersion) is NOT INSTALLED in this system." 'Red'
@@ -2095,39 +2229,27 @@ function Show-Fixable($list) {
 function Start-Console {
     if (-not $TestMode) { Clear-Host }
     Say '=================================================================' 'White'
+    Say ("$($Cfg.EditionName) | Build 2026.10.27.3") 'White'
     Say "  DSC Signer Service $($Cfg.DssVersion) - Check & Fix$(if($CheckOnly){'   [CHECK ONLY]'})$(if($TestMode){'   [TEST MODE]'})" 'White'
     Say "  Running as: $(if($IsAdmin){'Administrator'}else{'normal user (reopen PowerShell as Administrator for repairs)'})" 'Gray'
     Say '=================================================================' 'White'
     $handFix = @(); if ($script:Handoff) { $handFix = @($script:Handoff.fix | ForEach-Object { [int]$_ }) }
     $ready = Invoke-StartupSequence -OpenBrowser:(-not $CheckOnly) -FullCheck:($CheckOnly -or $handFix.Count -gt 0)
     foreach ($d in $Defs) { if ($d.Tested) { Show-Row $d.R } }
-    # installer missing? offer to locate it right away
-    if (-not $CheckOnly) { Invoke-InstallerCheckConsole }
-    $fixable = @(Get-Fixable)
-    $doFix = @()
-    if ($fixable.Count -and -not $CheckOnly) {
-        Say ''; Say "Problems / warnings that can be fixed ($($fixable.Count)):" 'White'
-        Show-Fixable $fixable
-        Say ''
-        if ($handFix.Count) {
-            $doFix = @($fixable | Where-Object { $handFix -contains $_.No } | ForEach-Object { $_.No })
-            if ($doFix.Count -and (Ask "   Fix now: $($doFix -join ', ')?  [Y/N] : " @('Y', 'N') 'N') -ne 'Y') { $doFix = @() }
-        } else {
-            $a = Ask '   STEP 9 - Run the fixes?  [Y] ALL   [S] Selected ones (asked one by one)   [N] Not now : ' @('Y', 'S', 'N') 'N'
-            if ($a -eq 'Y') { $doFix = @($fixable | ForEach-Object { $_.No }) }
-            elseif ($a -eq 'S') { foreach ($d in $fixable) { if ((Ask ("   Fix [{0}] {1}?  [Y/N] : " -f $d.DisplayNo, $d.Title) @('Y', 'N') 'N') -eq 'Y') { $doFix += $d.No } } }
-        }
-        foreach ($d in $fixable) { if ($doFix -notcontains $d.No -and $d.R.Status -eq 'FAIL') { $d.R.Status = 'SKIP'; $d.R.Advice = "Not fixed (you chose No). $($d.R.Advice)" } }
-        if ($doFix.Count -and -not $IsAdmin) {
-            Say ''; Say '   Fixing needs an Administrator PowerShell session.' 'Yellow'
-            if (Request-Elevation $doFix 'consolefix') { Say '   The fix continues in the new (administrator) window.' 'Green' }
-            [void](Save-Results); return
-        }
+    $state=Get-DscOverallState
+    Say ("Signer service: " + $state.Title) 'White'
+    Say (Get-DscFindingsSummary).Text
+    $fixable=@(Get-Fixable)
+    $doFix=@(Request-ConsoleReview $fixable)
+    if($doFix.Count -and -not $IsAdmin){
+        [void](Request-Elevation $doFix 'consolefix')
+        [void](Save-Results); return
     }
     if ($doFix.Count) {
         $script:RequestPackage = { Request-PackageConsole }
         Say ''; Say 'Fixing ...' 'White'
-        Invoke-Fixes $doFix
+        $script:ReviewApproved=$true
+        try {Invoke-Fixes $doFix} finally {$script:ReviewApproved=$false}
         Say ''; Say 'Testing again ...' 'White'; Say ''
         [void](Invoke-StartupSequence -FullCheck)
         foreach ($d in $Defs) { Show-Row $d.R }
@@ -2136,8 +2258,8 @@ function Start-Console {
     Say ''
     if ($Results['4'].Status -in 'OK', 'FIXED', 'WARN') { Say "   isLive: $($Results['4'].Value)" $(if ($Results['4'].Status -eq 'WARN') { 'Yellow' } else { 'Green' }) }
     $state=Get-DscOverallState
-    Say ("   >>> " + $state.Title + " <<<") $(if($state.Working){'Green'}else{'Yellow'})
-    Say $state.Detail
+    Say ("   Signer service: " + $state.Title) $(if($state.Working){'Green'}else{'Yellow'})
+    Say (Get-DscFindingsSummary).Text
     if (-not $CheckOnly -and $doFix.Count -and $Results['4'].Status -in 'OK', 'FIXED', 'WARN') {
         Say ''
         if ((Ask '   Open the isLive page in Chrome / Edge / Firefox so you can see "success"?  [Y/N] : ' @('Y', 'N') 'N') -eq 'Y') {
@@ -2199,7 +2321,7 @@ function Start-Gui {
     }
     $font = (New-UiFont 'Segoe UI' 9.5)
     $f = New-Object Windows.Forms.Form
-    $f.Text = "DSC Signer Service $($Cfg.DssVersion) - Check & Fix"
+    $f.Text = "$($Cfg.EditionName) | Build 2026.10.27.3 | DSS $($Cfg.DssVersion)"
     $f.Size = New-Object Drawing.Size(1100, 760); $f.MinimumSize = New-Object Drawing.Size(900, 600)
     $f.StartPosition = 'CenterScreen'; $f.Font = $font; $f.BackColor = [Drawing.Color]::White
     $G.Form = $f
@@ -2215,7 +2337,8 @@ function Start-Gui {
     # isLive banner
     $live = New-Object Windows.Forms.Label; $live.Dock = 'Top'; $live.Height = 44; $live.TextAlign = 'MiddleLeft'
     $live.Padding = New-Object Windows.Forms.Padding(16, 0, 0, 0); $live.Font = (New-UiFont 'Segoe UI Semibold' 12)
-    $live.Text = 'isLive: testing ...'; $live.UseMnemonic = $false; $t2.UseMnemonic = $false; $live.BackColor = [Drawing.Color]::FromArgb(240, 243, 247); $G.Live = $live
+    $other=New-Object Windows.Forms.Label; $other.Dock='Top'; $other.Height=32; $other.Padding=New-Object Windows.Forms.Padding(16,0,0,0); $other.TextAlign='MiddleLeft'; $other.Text='Other checks: diagnostics running ...'; $G.Findings=$other
+    $live.Text = 'Signer service: testing ...'; $live.UseMnemonic = $false; $t2.UseMnemonic = $false; $live.BackColor = [Drawing.Color]::FromArgb(240, 243, 247); $G.Live = $live
 
     # buttons
     $bar = New-Object Windows.Forms.FlowLayoutPanel; $bar.Dock = 'Bottom'; $bar.Height = 52; $bar.WrapContents = $true; $bar.AutoSize = $true; $bar.AutoSizeMode = 'GrowAndShrink'; $bar.Padding = New-Object Windows.Forms.Padding(10, 9, 10, 6)
@@ -2241,8 +2364,8 @@ function Start-Gui {
         [Windows.Forms.Application]::DoEvents()
     }
     $G.BTest = New-Btn 'Run full check' 115
-    $G.BFix = New-Btn 'Fix selected ...' 130
-    $G.BLocate = New-Btn 'Locate installer ...' 145
+    $G.BFix = New-Btn 'Review proposed fixes ...' 185
+    $G.BLocate = New-Btn 'Get DSS installer ...' 145
     $G.BOpen = New-Btn 'Open DSC isLive Service Test-Check in browsers' 330
     $G.BOpen.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $G.BOpen.UseVisualStyleBackColor = $false
     $G.BOpen.Font = (New-UiFont 'Segoe UI Semibold' 9.5)
@@ -2285,7 +2408,7 @@ function Start-Gui {
     $txt.Font = (New-UiFont 'Consolas' 9.5); $txt.BackColor = [Drawing.Color]::FromArgb(250, 251, 252); $G.Txt = $txt
     $split.Panel1.Controls.Add($lv); $split.Panel2.Controls.Add($txt)
 
-    $f.Controls.Add($split); $f.Controls.Add($live); $f.Controls.Add($hdr); $f.Controls.Add($bar); $f.Controls.Add($ss)
+    $f.Controls.Add($split); $f.Controls.Add($other); $f.Controls.Add($live); $f.Controls.Add($hdr); $f.Controls.Add($bar); $f.Controls.Add($ss)
     $G.Split = $split
 
 
@@ -2307,11 +2430,11 @@ function Start-Gui {
         foreach ($si in $it.SubItems) { $si.BackColor = $bg }
         if ($d.No -eq 3 -and $st -in 'FAIL', 'SKIP' -and $d.Last.NotInstalled) { $it.SubItems[3].ForeColor = $C.Bad; $it.SubItems[3].Font = (New-UiFont 'Segoe UI' 10 -Bold) }
         else { $it.SubItems[3].ForeColor = (Get-SysColor WindowText); $it.SubItems[3].Font = $script:G.List.Font }
-        $it.Checked = ($st -in 'FAIL', 'SKIP' -or ($st -eq 'WARN' -and $d.R.Fixable))
+        $it.Checked = $false
         [System.Windows.Forms.Application]::DoEvents()
     }
     $script:Ui = $f
-    $script:RequestPackage = { return ((Show-PackageDialog "The installer is needed to install DigitalSignerService $($Cfg.DssVersion) - select the zip / msi / folder") -eq 'ok') }
+    $script:RequestPackage = { if($Cfg.AllowDssDownload -and $Cfg.PackageUrl){return (Start-DssPackageRequest)}; return ((Show-PackageDialog "The installer is needed to install DigitalSignerService $($Cfg.DssVersion) - select the zip / msi / folder") -eq 'ok') }
 
     function Start-Flash { try { $script:G.Hand.Visible = $true; $script:G.Flash.Start() } catch { Write-DscError $_ 'Caught exception';} }
     function Stop-Flash {
@@ -2349,11 +2472,14 @@ function Start-Gui {
         $amberBg = [Drawing.Color]::FromArgb(253, 243, 225)
         $d3 = $ByNo[3]
         $state=Get-DscOverallState
-        $G.Live.Text=$state.Title + '  -  ' + $l.Value
+        $G.Live.Text='Signer service: '+$state.Title + '  -  ' + $l.Value
         $G.Live.ForeColor=$(if($state.Working){$C.Ok}elseif(-not $state.Verified){$C.Warn}else{$C.Bad})
         $G.Live.BackColor=$(if($state.Working){$C.OkBg}elseif(-not $state.Verified){$amberBg}else{$C.BadBg})
-        $G.Sub.Text=$state.Detail
-        $G.Stat.Text=$state.Title + " | additional issues: $($state.Failures), warnings: $($state.Warnings)"
+        $findings=Get-DscFindingsSummary
+        $G.Findings.Text=$findings.Text
+        $G.Findings.ForeColor=$(if($findings.Failures){$C.Bad}elseif($findings.Warnings){$C.Warn}else{$C.Ok})
+        $G.Sub.Text='Diagnostics only. Review proposed fixes when ready; no repair has been applied automatically.' 
+        $G.Stat.Text="Signer service: $($state.Title) | Other checks: $($findings.Failures) issues, $($findings.Warnings) warnings"
         $G.BFix.Enabled = ($fx.Count -gt 0)
         $miss = [bool]($ByNo[3].Tested -and $ByNo[3].R.Status -in 'FAIL', 'SKIP' -and $ByNo[3].Last.NotInstalled -and -not (Find-DssPackageSource))
         $G.BLocate.BackColor = $(if ($miss) { $C.Amber } else { (Get-SysColor Control) })
@@ -2371,6 +2497,7 @@ function Start-Gui {
     }
     # DSS 4.1.8 not installed and no installer chosen: red pop-up with the same locate dialog, then test 3 again
     function Invoke-InstallerCheckGui {
+        if($Cfg.AllowDssDownload -and $Cfg.PackageUrl){return}
         $d3 = $ByNo[3]
         if (-not $d3.Tested -or $d3.R.Status -notin 'FAIL', 'SKIP' -or -not $d3.Last.NotInstalled) { return }
         if (Find-DssPackageSource) { return }
@@ -2384,9 +2511,14 @@ function Start-Gui {
     # step 9: after the dashboard - fix ALL, choose the rows, or not now
     function Show-FixChoice {
         $fx = @(Get-Fixable); if (-not $fx.Count) { return }
+        $selected=@($script:G.List.CheckedItems | ForEach-Object {[int]$_.Tag})
+        if($selected.Count){$fx=@($fx | Where-Object {$selected -contains $_.No})}
+        $script:DiagnosticsOnly=$false
+        $script:DssDownloadConsent='NotAsked';$script:DssDownloadConsentKey=''
+        try {[void](Prepare-DscInstaller)} finally {$script:DiagnosticsOnly=$true}
         $C = $script:GC
         $d = New-Object Windows.Forms.Form
-        $d.Text = 'Step 9 - Run the fixes'; $d.Size = New-Object Drawing.Size(780, (250 + 20 * [Math]::Min($fx.Count, 10)))
+        $d.Text = 'Review proposed fixes - no changes until Apply'; $d.Size = New-Object Drawing.Size(780, (250 + 20 * [Math]::Min($fx.Count, 10)))
         $d.StartPosition = 'CenterParent'; $d.FormBorderStyle = 'FixedDialog'; $d.MaximizeBox = $false; $d.MinimizeBox = $false
         $d.Font = (New-UiFont 'Segoe UI' 9.5); $d.BackColor = [Drawing.Color]::White
         $hd = New-Object Windows.Forms.Label; $hd.UseMnemonic = $false; $hd.AutoSize = $false; $hd.Location = New-Object Drawing.Point(18, 12); $hd.Size = New-Object Drawing.Size(730, 26)
@@ -2396,9 +2528,9 @@ function Start-Gui {
         $lst.Text = (($fx | ForEach-Object { "[$($_.DisplayNo)] $($_.Title)  ($(Get-Label $_.R.Status))`r`n      -> $($_.Plan)" }) -join "`r`n")
         $nt = New-Object Windows.Forms.Label; $nt.UseMnemonic = $false; $nt.AutoSize = $false; $nt.Size = New-Object Drawing.Size(730, 38)
         $nt.Location = New-Object Drawing.Point(18, ($lst.Top + $lst.Height + 8)); $nt.ForeColor = $C.Mute
-        $nt.Text = 'Backups are saved first.' + $(if (-not $IsAdmin) { ' Windows will ask for administrator permission, then the tool reopens as administrator and continues.' } else { '' })
+        $nt.Text = 'No DSS installation snapshot is created. Existing PATH/hosts repair safeguards remain.' + $(if (-not $IsAdmin) { ' Windows will ask for administrator permission, then the tool reopens as administrator and continues.' } else { '' })
         $y = $nt.Top + $nt.Height + 8
-        $ba = New-Object Windows.Forms.Button; $ba.Text = "Fix ALL ($($fx.Count))"; $ba.Location = New-Object Drawing.Point(18, $y); $ba.Size = New-Object Drawing.Size(150, 36)
+        $ba = New-Object Windows.Forms.Button; $ba.Text = "Apply listed ($($fx.Count))"; $ba.Location = New-Object Drawing.Point(18, $y); $ba.Size = New-Object Drawing.Size(150, 36)
         $ba.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $ba.UseVisualStyleBackColor = $false; $ba.Font = (New-UiFont 'Segoe UI Semibold' 10)
         $bs = New-Object Windows.Forms.Button; $bs.Text = 'Select items ...'; $bs.Location = New-Object Drawing.Point(176, $y); $bs.Size = New-Object Drawing.Size(150, 36)
         $bn = New-Object Windows.Forms.Button; $bn.Text = 'Not now'; $bn.Location = New-Object Drawing.Point(334, $y); $bn.Size = New-Object Drawing.Size(110, 36)
@@ -2407,15 +2539,15 @@ function Start-Gui {
         $ba.Add_Click({ Invoke-UiSafe { $script:FixDlg.Result = 'all'; $script:FixDlg.Form.Close() } })
         $bs.Add_Click({ Invoke-UiSafe { $script:FixDlg.Result = 'select'; $script:FixDlg.Form.Close() } })
         $bn.Add_Click({ Invoke-UiSafe { $script:FixDlg.Result = 'none'; $script:FixDlg.Form.Close() } })
-        $d.AcceptButton = $ba
+        $d.AcceptButton = $bn; $d.CancelButton = $bn
         [void]$d.ShowDialog($script:G.Form)
         switch ($script:FixDlg.Result) {
-            'all'    { Invoke-GuiFix (@($fx | ForEach-Object { $_.No })) -NoAsk }
+            'all'    { $script:ReviewApproved=$true; try {Invoke-GuiFix (@($fx | ForEach-Object { $_.No })) -NoAsk} finally {$script:ReviewApproved=$false} }
             'select' {
-                $script:G.Sub.Text = "Tick the rows you want fixed (untick the others), then click 'Fix selected'."
+                $script:G.Sub.Text = "Tick the rows you want fixed (untick the others), then click 'Review proposed fixes'."
                 $script:G.BFix.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $script:G.BFix.UseVisualStyleBackColor = $false
             }
-            default  { $script:G.Sub.Text = "Nothing was changed. Tick rows and click 'Fix selected' whenever you are ready." }
+            default  { $script:G.Sub.Text = "Nothing was changed. Tick rows and click 'Review proposed fixes' whenever you are ready." }
         }
     }
     function Invoke-GuiFix([int[]]$nos, [switch]$NoAsk) {
@@ -2423,7 +2555,7 @@ function Start-Gui {
         if (-not $NoAsk) {
             $msg = "The tool will make these changes on this PC:`r`n`r`n"
             foreach ($n in $nos) { $msg += "[$($ByNo[$n].DisplayNo)] $($ByNo[$n].Title)`r`n      -> $($ByNo[$n].Plan)`r`n" }
-            $msg += "`r`nBackups are saved first."
+            $msg += "`r`nNo DSS installation snapshot is created. Existing PATH/hosts repair safeguards remain."
             if (-not $IsAdmin) { $msg += "`r`n`r`nThis needs administrator rights: Windows will ask for permission, then the tool reopens as administrator and continues." }
             $msg += "`r`n`r`nContinue?"
             if ([Windows.Forms.MessageBox]::Show($msg, 'Permission to fix', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question) -ne 'Yes') { return }
@@ -2449,7 +2581,7 @@ function Start-Gui {
     # ---- events
     $lv.Add_ItemCheck({ param($s, $e) $d = $ByNo[[int]$s.Items[$e.Index].Tag]; if (-not ($d.R.Status -in 'FAIL', 'SKIP' -or ($d.R.Status -eq 'WARN' -and $d.R.Fixable))) { $e.NewValue = 'Unchecked' } })
     $lv.Add_SelectedIndexChanged({ Invoke-UiSafe { Show-Detail } })
-    $G.BTest.Add_Click({ Invoke-UiSafe { Invoke-GuiTest -Full; Invoke-InstallerCheckGui; Show-Detail; Show-FixChoice } })
+    $G.BTest.Add_Click({ Invoke-UiSafe { Invoke-GuiTest -Full; Show-Detail } })
     $G.BCertificate.Add_Click({ Invoke-UiSafe { Show-SignerCertificateHelp -UseGui } })
     $G.BJavaUpdate.Add_Click({ Invoke-UiSafe {
         if (-not $IsAdmin) { [void][Windows.Forms.MessageBox]::Show('Reopen this tool in an Administrator PowerShell session and select Update Java.', 'Optional Java update'); return }
@@ -2464,11 +2596,19 @@ function Start-Gui {
     $G.BGitHub.Add_Click({ Invoke-UiSafe { Save-DscSession $Results; Show-DscGitHubReport -UseGui } })
     $G.BImprove.Add_Click({ Invoke-UiSafe { Save-DscSession $Results; Show-DscGitHubReport -Kind Improvement -UseGui } })
     $G.BLocate.Add_Click({ Invoke-UiSafe {
+        if($Cfg.AllowDssDownload -and $Cfg.PackageUrl){
+            Set-Busy $true
+            try {
+                if(Start-DssPackageRequest){Invoke-GuiTest -Full;Show-Detail}
+                else {[void][Windows.Forms.MessageBox]::Show('Download was not approved or no valid package was obtained. No installation was changed. See the log or retry Get DSS installer.', 'DSS installer')}
+            } finally {Set-Busy $false;Update-Summary}
+            return
+        }
         $res = Show-PackageDialog
         if ($res -eq 'exit') { return }
         if (-not ($Defs | Where-Object { $_.Tested })) {
             # nothing tested yet: same as the start - ask to perform the check
-            Invoke-GuiTest; Invoke-InstallerCheckGui; Show-Detail; Show-FixChoice
+            Invoke-GuiTest; Show-Detail
         } else {
             Set-Busy $true; Invoke-AllTests @(3); [void](Save-Results); Set-Busy $false; Update-Summary
             foreach ($row in $script:G.List.Items) { if ([int]$row.Tag -eq 3) { $row.Selected = $true } }
@@ -2490,9 +2630,8 @@ function Start-Gui {
         if ($out) { [void][Windows.Forms.MessageBox]::Show("Created:`r`n$out`r`n`r`nCopy this one file to any PC and double-click it - the installer is inside.", 'Build single-file tool', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) }
     } })
     $G.BFix.Add_Click({ Invoke-UiSafe {
-        $nos = @($script:G.List.CheckedItems | ForEach-Object { [int]$_.Tag })
-        if (-not $nos.Count) { [void][Windows.Forms.MessageBox]::Show('Nothing is ticked. Tick the FAILED / WARNING rows you want to fix.', 'Fix', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information); return }
-        Invoke-GuiFix $nos
+        Set-Busy $true
+        try { Show-FixChoice } finally { Set-Busy $false; Update-Summary }
     } })
     function Show-PackageDialog([string]$Reason = '', [switch]$Start) {
         # one dialog for every place the installer is needed: start, 'Locate installer', DSS not installed, Fix
@@ -2559,14 +2698,12 @@ function Start-Gui {
             $script:G.Sub.Text = "Reopened as administrator to fix: $($hand -join ', ') - testing again first ..."
             Invoke-GuiTest -Full
             $todo = @(Get-Fixable | Where-Object { $hand -contains $_.No } | ForEach-Object { $_.No })
-            if ($todo.Count) { Invoke-GuiFix $todo -NoAsk }
+            if ($todo.Count) { $script:G.Sub.Text="Diagnostics complete. Review proposed fixes to continue after elevation." }
             else { [void][Windows.Forms.MessageBox]::Show('Nothing left to fix - it already works.', 'Fix', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) }
         } else {
             $script:G.Sub.Text = 'Step 1: opening isLive; expiry-only alerts are warnings. Continuing the ordered checks ...'
             Invoke-GuiTest
-            Invoke-InstallerCheckGui
             Show-Detail
-            Show-FixChoice
         }
         Show-Detail
     } })
@@ -2587,24 +2724,49 @@ function Invoke-DscSelection([string]$Selection) {
 if ($Mode -ne 'menu') { Invoke-DscSelection $Mode; return }
 while ($true) {
     Write-Host ''
-    Write-Host 'DSC-FIXER - Native PowerShell' -ForegroundColor Cyan
-    Write-Host '1. DSC Fix - PowerShell console'
-    Write-Host '2. DSC Fix - Windows popups'
-    Write-Host '3. Back to menu / redraw'
-    Write-Host '4. Exit'
-    Write-Host '5. Preview error report / GitHub'
-    Write-Host '6. Suggest improvement / GitHub'
+    Write-Host 'DSC-FIXER - Native PowerShell | Build 2026.10.27.3' -ForegroundColor Cyan
+    Write-Host 'Developed by Girish Tiwari - Senior Information Technology, Certified Microsoft Engineer' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host ''
+    Write-Host '  1. PowerShell Console Method' -ForegroundColor Green
+    Write-Host ''
+    Write-Host '  2. Windows GUI-New Window Console Method' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  3. Refresh menu' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  4. Exit' -ForegroundColor Gray
+    Write-Host ''
     Write-Host ('Session logs: ' + $script:DscSessionDirectory)
     Write-Host 'Checks run first. Repairs require your selection and an Administrator session.'
-    $choice = Read-Host 'Choose 1-6'
+    $menuInstruction = 'Select any one option to proceed further (1-4):'
+    # Do not consume the first key: Read-Host must receive the user's selection.
+    $canFlash = $Host.Name -eq 'ConsoleHost' -and -not [Console]::IsOutputRedirected -and -not [Console]::IsInputRedirected
+    if ($canFlash) {
+        try {
+            $highlight = $true
+            while (-not [Console]::KeyAvailable) {
+                if ($highlight) {
+                    Write-Host ("`r" + $menuInstruction) -NoNewline -ForegroundColor Black -BackgroundColor Yellow
+                } else {
+                    Write-Host ("`r" + (' ' * $menuInstruction.Length)) -NoNewline
+                }
+                $highlight = -not $highlight
+                Start-Sleep -Milliseconds 400
+            }
+        } catch {
+            # Hosts without console keyboard support use the normal prompt.
+        }
+        Write-Host ("`r" + $menuInstruction) -ForegroundColor Yellow
+    } else {
+        Write-Host $menuInstruction -ForegroundColor Yellow
+    }
+    $choice = Read-Host 'Choose 1-4'
     switch ($choice) {
         '1' { Invoke-DscSelection 'console' }
         '2' { Invoke-DscSelection 'gui' }
         '3' { continue }
         '4' { return }
-        '5' { Show-DscGitHubReport }
-        '6' { Show-DscGitHubReport -Kind Improvement }
-        default { Write-Host 'Enter a number from 1 to 6.' -ForegroundColor Yellow }
+        default { Write-Host 'Enter a number from 1 to 4.' -ForegroundColor Yellow }
     }
 }
 } catch {

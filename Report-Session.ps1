@@ -4,7 +4,7 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { throw 'Org
 # Session logging is embedded so each published entry point remains self-contained.
 function Initialize-DscSession([string]$Repository, [string]$ModeName) {
     $script:DscSession = [ordered]@{
-        Schema = 1; ToolVersion = '2026.10.26.4'; Repository = $Repository
+        Schema = 1; ToolVersion = '2026.10.27.3'; Repository = $Repository
         SessionId = [guid]::NewGuid().ToString('N'); StartedUtc = [DateTime]::UtcNow.ToString('o')
         UpdatedUtc = ''; Mode = $ModeName; PowerShell = $PSVersionTable.PSVersion.ToString()
         State = 'Running'; ErrorCount = 0; Checks = @(); Improvements = @()

@@ -1,5 +1,7 @@
 # DSC-FIXER - Native PowerShell test edition
 
+> Current local build: **2026.10.27.3**. All editions now support permission-based DSS installer downloads. Earlier local-package-only capability notes below are superseded by the Download permission and repository backups section.
+
 Run in Windows PowerShell:
 
 ```powershell
@@ -27,7 +29,7 @@ Each launch keeps a unique session under `%LOCALAPPDATA%\DSC-Signer-Fixer\sessio
 - `session.json`: tool version, session ID, mode, latest check statuses, action counts, error groups and unresolved-check follow-ups.
 - `github-report.md`: allowlisted preview suitable for optional GitHub submission. Application sessions also retain `fix-log.txt`, `result.json`, HTML reports and backups.
 
-Use **Report error ...** or **Suggest improvement ...** in the dashboard. Console mode offers the same choices after a run; native menus also offer options 5 and 6. Check-only mode never prompts to report.
+Use **Report error ...** or **Suggest improvement ...** in the dashboard. Console mode offers the same choices after a run; the startup menu contains only options 1-4 and displays the session-log folder. Check-only mode never prompts to report.
 
 To report a saved session later (including an offline session or launcher failure), download `Report-Session.ps1` from this repository and run:
 
@@ -73,3 +75,22 @@ Run `tests\Test-Release.ps1` for the release regression suite and `tests\Test-St
 ## Live-test corrections (2026.10.26.4)
 
 Visible check numbers now run 1–10 in workflow order; stable internal IDs remain in logs. GUI rows update by their identity instead of the old list index. isLive readiness is independent of supplemental issues: confirmed success, including the accepted signer expiry warning, displays WORKING. Other issues remain visible in their own rows; unavailable probes are warnings, not evidence of service failure. Java version output is read from both native process streams. Empty browser output is explicitly unverified and does not propose an automatic repair.
+
+
+## Diagnostics and review (2026.10.27.1)
+
+The GUI and console identify their edition and build. Signer service health and other-check findings have separate summaries. Initial checks are diagnostics-only: no repair selection modal, installer prompt, installer preparation/download or repair runs automatically. Select **Review proposed fixes** (console: R) to inspect plans and prepare a needed installer within the edition's existing capability. Then explicitly choose Apply; no repair checkbox is preselected. Elevated restarts return to diagnostics/review rather than automatically resuming repairs. Explicit installer preparation and optional Java update controls remain user-initiated actions. No commits or pushes have been made.
+
+
+## Download permission and repository backups (2026.10.27.3)
+
+All editions now offer an explicit DSS 4.1.8 download permission prompt for installation fix #2, following the user's revised instruction. Initial diagnostics still do not download installers. Approving the download saves it under Downloads, checks any supplied checksum, validates its content/version and maps the extracted MSI automatically. The installation is still a separate reviewed action. Declining or failing the download never stops/uninstalls DSS and does not automatically open the ZIP/MSI/folder mapping dialog. Get DSS installer retries permission; manual local packages remain available when downloads are explicitly disabled with DSSF_NO_PACKAGE=1 (FIXR launcher: -NoPackage).
+
+Repository source files are backed up before development edits. No backup or snapshot of the user's DSS installation is created or required. Download permission, package validation/mapping and reviewed installation remain available.
+
+Before editing repository sources, always create and verify a timestamped backup outside the repository, excluding Git metadata; never overwrite older backups. Keep a file/hash inventory. No commit or push without explicit user approval.
+
+
+## Backup scope clarification (2026.10.27.3)
+
+The user's backup instruction applies only to repository source files before editing. The user-side DSS installation-backup function and prerequisite have been removed from GUI/console editions. Existing archived backups are not deleted. Download permission, automatic validation/mapping and the reviewed installation/repair flow are unchanged. The historical test filename Test-DownloadBackup.ps1 now covers downloads and verifies that installation snapshots are absent. Standard PATH/hosts repair copies remain as before. No commits or pushes were made.
