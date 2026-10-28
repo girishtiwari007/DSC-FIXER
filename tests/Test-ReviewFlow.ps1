@@ -72,19 +72,19 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
     Assert-Review ($G.List.CheckedItems.Count -eq 0) 'no repair checkbox is preselected after diagnosis'
     $onShown=$f.GetType().GetMethod('OnShown',[Reflection.BindingFlags]'Instance,NonPublic')
     [void]$onShown.Invoke($f,@([EventArgs]::Empty))
-    Assert-Review ($script:GuiDiagnostics -eq 1 -and $script:GuiReview -eq 0 -and $script:GuiRepairs -eq 0) 'actual GUI startup invokes diagnostics but never review or repairs'
+    Assert-Review ($script:GuiDiagnostics -eq 1 -and $script:GuiReview -eq 1 -and $script:GuiRepairs -eq 0) 'actual GUI startup completes diagnostics then opens review without repairs'
     Assert-Review ($f.Text.Contains('Test edition') -and $f.Text.Contains('Build 2026.10.27.3')) 'actual window title identifies edition and exact build'
     Assert-Review ($G.Live.Text.StartsWith('Signer service: WORKING') -and $G.Findings.Text.StartsWith('Other checks: 1 need attention')) 'actual dashboard shows service and other checks separately'
-    Assert-Review ($G.BFix.Text -eq 'Review proposed fixes ...') 'main action explicitly reviews before applying'
+    Assert-Review ($G.BFix.Text -eq 'Review / Pending fixes ...') 'main action explicitly reviews before applying'
     $onClick=$G.BTest.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic')
     [void]$onClick.Invoke($G.BTest,@([EventArgs]::Empty))
-    Assert-Review ($script:GuiDiagnostics -eq 2 -and $script:GuiReview -eq 0 -and $script:GuiRepairs -eq 0) 'actual full-check button never opens review automatically'
+    Assert-Review ($script:GuiDiagnostics -eq 2 -and $script:GuiReview -eq 1 -and $script:GuiRepairs -eq 0) 'later full checks do not repeat the initial review'
     $script:Handoff=@{fix=@(5)}
     [void]$onShown.Invoke($f,@([EventArgs]::Empty))
-    Assert-Review ($script:GuiRepairs -eq 0 -and $script:GuiReview -eq 0) 'actual elevated-handoff startup does not resume repairs automatically'
+    Assert-Review ($script:GuiRepairs -eq 0 -and $script:GuiReview -eq 1) 'actual elevated-handoff startup does not resume repairs automatically'
     $reviewClick=$G.BFix.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic')
     [void]$reviewClick.Invoke($G.BFix,@([EventArgs]::Empty))
-    Assert-Review ($script:GuiReview -eq 1 -and $script:GuiRepairs -eq 0) 'explicit review click reaches review without applying anything'
+    Assert-Review ($script:GuiReview -eq 2 -and $script:GuiRepairs -eq 0) 'explicit review click reaches review without applying anything'
     # Construct the real review modal, replacing only its blocking display call.
     $actualReview=$review.Replace('[void]$d.ShowDialog($script:G.Form)',"Assert-Review (`$d.AcceptButton -eq `$bn -and `$d.CancelButton -eq `$bn) 'Enter and Escape default to no repair'; Assert-Review (`$ba.Text.StartsWith('Apply listed')) 'Apply is an explicit separate review action'")
     . ([scriptblock]::Create($actualReview))

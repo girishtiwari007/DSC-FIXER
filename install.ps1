@@ -184,7 +184,7 @@ $TestRoot = $env:DSSF_TESTROOT
 $TestMode = -not [string]::IsNullOrEmpty($TestRoot)
 $CheckOnly = ($RequestedMode -eq 'check')
 $Mode = $(if ($RequestedMode -eq 'gui') { 'gui' } else { 'console' })
-$script:Ui = $null; $script:UiJavaOffer = $null; $script:DssInstallOffered=$false
+$script:Ui = $null; $script:UiJavaOffer = $null; $script:DssInstallOffered=$false; $script:InitialReviewShown=$false; $script:CancelRequested=$false; $script:RepairRunning=$false
 $script:UiLog = $null
 $script:UiStatus = $null
 $script:UiRow = $null
@@ -1514,15 +1514,20 @@ function Stop-Dss($r) {
 function Start-DssAdmin($r) {
     $exe = Find-DssExe
     if (-not $exe) { Add-Action $r 'Signer Service program not found - cannot start'; return $false }
+    $promptHelp='If Windows/Java asks to allow Digital Signer Service, verify the program path/publisher is the approved signer or its Java runtime, then choose Allow for your trusted organization network. Keep Public networks unselected unless IT requires them. Do not approve unrelated Java programs.'
+    Add-Action $r $promptHelp
+    if($script:UiStatus){& $script:UiStatus 'Starting signer: check for a Windows/Java Allow prompt behind this window.'}
+    Update-Ui
     Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) | Out-Null
     Add-Action $r "Started '$exe' as Administrator"
     $deadline = (Get-Date).AddSeconds([int]$Cfg.StartWaitSeconds)
     while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 2
+        for($tick=0;$tick -lt 20;$tick++){Start-Sleep -Milliseconds 100;Update-Ui}
         $x = [DssfHttpV3]::Get($Cfg.IsLiveUrl, $false, 3000)
         if ($x.Ok) { return $true }
     }
-    Add-Action $r "Service did not answer within $($Cfg.StartWaitSeconds) s"
+    $r.Advice=$promptHelp
+    Add-Action $r "Service did not answer within $($Cfg.StartWaitSeconds) s. Check for a pending Windows/Java prompt, then run the check again."
     return $false
 }
 function Set-DssRunAsAdmin($r) {
@@ -1948,7 +1953,7 @@ function Invoke-OptionalJavaUpdate([switch]$Confirmed) {
 
 function Prepare-DscInstaller {
     if($script:DiagnosticsOnly){
-        if($Results['3'].Status -in 'FAIL','SKIP'){Add-Detail $Results['3'] 'Installer preparation is deferred until Review proposed fixes.'}
+        if($Results['3'].Status -in 'FAIL','SKIP'){Add-Detail $Results['3'] 'Installer preparation is deferred until Review / Pending fixes.'}
         return $false
     }
     if ($Results['3'].Status -notin 'FAIL','SKIP') { return $false }
@@ -2020,7 +2025,7 @@ function Get-DscFindingsSummary {
 function Request-ConsoleReview($Fixable) {
     if($CheckOnly -or -not @($Fixable).Count){return @()}
     Say 'Diagnostics finished. No repairs have been applied.' 'White'
-    if((Ask '   [R] Review proposed fixes   [N] Finish without repairs : ' @('R','N') 'N') -ne 'R'){return @()}
+    if((Ask '   [R] Review / Pending fixes   [N] Finish without repairs : ' @('R','N') 'N') -ne 'R'){return @()}
     $script:DiagnosticsOnly=$false
     $script:DssDownloadConsent='NotAsked';$script:DssDownloadConsentKey=''
     try {
@@ -2217,14 +2222,18 @@ function Set-NotNeeded {
     foreach ($d in $Defs) { if (-not $d.Tested) { $d.R.Status = 'NOTRUN'; $d.R.Value = 'not needed - secure isLive success'; if ($script:UiRow) { & $script:UiRow $d } } }
 }
 function Invoke-Fixes([int[]]$nos) {
-    if(-not $script:ReviewApproved){throw 'Review proposed fixes and explicitly apply them before running repairs.'}
+    if(-not $script:ReviewApproved){throw 'Review / Pending fixes and explicitly apply them before running repairs.'}
     foreach ($no in $FixOrder) {
         if ($nos -notcontains $no) { continue }
-        $d = $ByNo[$no]; $r = $d.R; $d.Fixed = $true
+        Update-Ui
+        if($script:CancelRequested){Write-DscEvent 'Info' 'Repair queue stopped' @{BeforeCheck=$no}; break}
+        $d = $ByNo[$no]; $r = $d.R
         if ($script:UiStatus) { & $script:UiStatus "Fixing [$no] $($d.Title) ..." }
         Say ''; Say ("   [{0}] {1}" -f $no, $d.Title) 'White'
         try { $t = & $d.T; if ($null -eq $t) { throw 'Repair precheck returned no result.' } }
         catch { Write-DscError $_ ("Repair precheck " + $no); $r.Status = 'FAIL'; $r.Advice = 'Repair was skipped because its precheck failed.'; continue }
+        if($script:CancelRequested){break}
+        $d.Fixed=$true
         Write-DscEvent 'Info' 'Repair attempted' @{ Check = $no }
         if ($t.Pass -and -not $t.Warn) { Add-Detail $r 'Solved by an earlier fix'; Say '      -> already solved by an earlier fix' 'Cyan' }
         else { try { & $d.F $r $t } catch { Write-DscError $_ ("Repair check " + $no); $r.Status = 'FAIL'; $r.Advice = $_.Exception.Message; Add-Detail $r "Repair error: $($_.Exception.Message)"; Log $_.ScriptStackTrace } }
@@ -2455,7 +2464,7 @@ function Start-Gui {
         [Windows.Forms.Application]::DoEvents()
     }
     $G.BTest = New-Btn 'Run full check' 115
-    $G.BFix = New-Btn 'Review proposed fixes ...' 185
+    $G.BFix = New-Btn 'Review / Pending fixes ...' 185
     $G.BLocate = New-Btn 'Download + install DSS ...' 185
     $G.BOpen = New-Btn 'Open DSC isLive Service Test-Check in browsers' 330
     $G.BOpen.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $G.BOpen.UseVisualStyleBackColor = $false
@@ -2463,12 +2472,13 @@ function Start-Gui {
     $G.BReport = New-Btn 'Open report' 105
     $G.BPack = New-Btn 'Batch packing unavailable' 150; $G.BPack.Visible = $false
     $G.BClose = New-Btn 'Close' 80
+    $G.BCancel = New-Btn 'Cancel remaining fixes' 165; $G.BCancel.Enabled=$false
     # pointing hand (Wingdings 'F' = right-pointing hand, present on every Windows) + flashing 'Open DSC isLive' button
     $G.Hand = New-Object Windows.Forms.Label; $G.Hand.UseMnemonic = $false; $G.Hand.AutoSize = $true; $G.Hand.Text = 'F'
     $G.Hand.Font = (New-UiFont 'Wingdings' 20); $G.Hand.ForeColor = [Drawing.Color]::FromArgb(198, 40, 40)
     $G.Hand.Margin = New-Object Windows.Forms.Padding(10, 0, 2, 0); $G.Hand.Visible = $false
     $G.BOpen.Cursor = [Windows.Forms.Cursors]::Hand
-    $bar.Controls.AddRange(@($G.BTest, $G.BFix, $G.BLocate, $G.Hand, $G.BOpen, $G.BReport, $G.BPack, $G.BClose))
+    $bar.Controls.AddRange(@($G.BTest, $G.BFix, $G.BLocate, $G.Hand, $G.BOpen, $G.BReport, $G.BPack, $G.BCancel, $G.BClose))
     $G.Flash = New-Object Windows.Forms.Timer; $G.Flash.Interval = 450; $script:FlashOn = $false
     $G.Flash.Add_Tick({
         try {
@@ -2535,6 +2545,9 @@ function Start-Gui {
         } catch { Write-DscError $_ 'Caught exception';}
     }
     function Set-Busy([bool]$b) {
+        $script:G.Busy=$b
+        $script:G.BClose.Enabled=-not $b
+        $script:G.BCancel.Enabled=($b -and $script:RepairRunning -and -not $script:CancelRequested)
         foreach ($k in 'BTest', 'BFix', 'BLocate', 'BOpen', 'BReport', 'BPack', 'BGitHub', 'BImprove', 'BJavaUpdate', 'BCertificate') { $script:G[$k].Enabled = -not $b }
         $script:G.Prog.Visible = $b
         $script:G.Form.Cursor = $(if ($b) { [Windows.Forms.Cursors]::WaitCursor } else { [Windows.Forms.Cursors]::Default })
@@ -2569,7 +2582,7 @@ function Start-Gui {
         $findings=Get-DscFindingsSummary
         $G.Findings.Text=$findings.Text
         $G.Findings.ForeColor=$(if($findings.Failures){$C.Bad}elseif($findings.Warnings){$C.Warn}else{$C.Ok})
-        $G.Sub.Text='Diagnostics only. Review proposed fixes when ready; no repair has been applied automatically.' 
+        $G.Sub.Text='Diagnostics only. Review / Pending fixes when ready; no repair has been applied automatically.' 
         $G.Stat.Text="Signer service: $($state.Title) | Other checks: $($findings.Failures) issues, $($findings.Warnings) warnings"
         $G.BFix.Enabled = ($fx.Count -gt 0)
         $miss = [bool]($ByNo[3].Tested -and $ByNo[3].R.Status -in 'FAIL', 'SKIP' -and $ByNo[3].Last.NotInstalled -and -not (Find-DssPackageSource))
@@ -2600,16 +2613,19 @@ function Start-Gui {
         }
     }
     # step 9: after the dashboard - fix ALL, choose the rows, or not now
+    function Show-InitialPendingReview {
+        if($script:InitialReviewShown){return}
+        $script:InitialReviewShown=$true
+        if(@(Get-Fixable).Count){Show-FixChoice}
+    }
     function Show-FixChoice {
         $fx = @(Get-Fixable); if (-not $fx.Count) { return }
         $selected=@($script:G.List.CheckedItems | ForEach-Object {[int]$_.Tag})
         if($selected.Count){$fx=@($fx | Where-Object {$selected -contains $_.No})}
-        $script:DiagnosticsOnly=$false
-        $script:DssDownloadConsent='NotAsked';$script:DssDownloadConsentKey=''
-        try {[void](Prepare-DscInstaller)} finally {$script:DiagnosticsOnly=$true}
+        # Review is display-only: downloads and mapping start only after Apply.
         $C = $script:GC
         $d = New-Object Windows.Forms.Form
-        $d.Text = 'Review proposed fixes - no changes until Apply'; $d.Size = New-Object Drawing.Size(780, (250 + 20 * [Math]::Min($fx.Count, 10)))
+        $d.Text = 'Review / Pending fixes - no changes until Apply'; $d.Size = New-Object Drawing.Size(780, (250 + 20 * [Math]::Min($fx.Count, 10)))
         $d.StartPosition = 'CenterParent'; $d.FormBorderStyle = 'FixedDialog'; $d.MaximizeBox = $false; $d.MinimizeBox = $false
         $d.Font = (New-UiFont 'Segoe UI' 9.5); $d.BackColor = [Drawing.Color]::White
         $hd = New-Object Windows.Forms.Label; $hd.UseMnemonic = $false; $hd.AutoSize = $false; $hd.Location = New-Object Drawing.Point(18, 12); $hd.Size = New-Object Drawing.Size(730, 26)
@@ -2619,12 +2635,12 @@ function Start-Gui {
         $lst.Text = (($fx | ForEach-Object { "[$($_.DisplayNo)] $($_.Title)  ($(Get-Label $_.R.Status))`r`n      -> $($_.Plan)" }) -join "`r`n")
         $nt = New-Object Windows.Forms.Label; $nt.UseMnemonic = $false; $nt.AutoSize = $false; $nt.Size = New-Object Drawing.Size(730, 38)
         $nt.Location = New-Object Drawing.Point(18, ($lst.Top + $lst.Height + 8)); $nt.ForeColor = $C.Mute
-        $nt.Text = 'No DSS installation snapshot is created. Existing PATH/hosts repair safeguards remain.' + $(if (-not $IsAdmin) { ' Windows will ask for administrator permission, then the tool reopens as administrator and continues.' } else { '' })
+        $nt.Text = 'No DSS installation snapshot is created. Existing PATH/hosts repair safeguards remain.' + $(if (-not $IsAdmin) { ' Reopen Windows PowerShell as Administrator before applying repairs.' } else { '' })
         $y = $nt.Top + $nt.Height + 8
         $ba = New-Object Windows.Forms.Button; $ba.Text = "Apply listed ($($fx.Count))"; $ba.Location = New-Object Drawing.Point(18, $y); $ba.Size = New-Object Drawing.Size(150, 36)
         $ba.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $ba.UseVisualStyleBackColor = $false; $ba.Font = (New-UiFont 'Segoe UI Semibold' 10)
         $bs = New-Object Windows.Forms.Button; $bs.Text = 'Select items ...'; $bs.Location = New-Object Drawing.Point(176, $y); $bs.Size = New-Object Drawing.Size(150, 36)
-        $bn = New-Object Windows.Forms.Button; $bn.Text = 'Not now'; $bn.Location = New-Object Drawing.Point(334, $y); $bn.Size = New-Object Drawing.Size(110, 36)
+        $bn = New-Object Windows.Forms.Button; $bn.Text = 'Cancel fixes'; $bn.Location = New-Object Drawing.Point(334, $y); $bn.Size = New-Object Drawing.Size(110, 36)
         $d.Controls.AddRange(@($hd, $lst, $nt, $ba, $bs, $bn))
         $script:FixDlg = @{ Form = $d; Result = 'none' }
         $ba.Add_Click({ Invoke-UiSafe { $script:FixDlg.Result = 'all'; $script:FixDlg.Form.Close() } })
@@ -2635,10 +2651,10 @@ function Start-Gui {
         switch ($script:FixDlg.Result) {
             'all'    { $script:ReviewApproved=$true; try {Invoke-GuiFix (@($fx | ForEach-Object { $_.No })) -NoAsk} finally {$script:ReviewApproved=$false} }
             'select' {
-                $script:G.Sub.Text = "Tick the rows you want fixed (untick the others), then click 'Review proposed fixes'."
+                $script:G.Sub.Text = "Tick the rows you want fixed (untick the others), then click 'Review / Pending fixes'."
                 $script:G.BFix.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $script:G.BFix.UseVisualStyleBackColor = $false
             }
-            default  { $script:G.Sub.Text = "Nothing was changed. Tick rows and click 'Review proposed fixes' whenever you are ready." }
+            default  { $script:G.Sub.Text = "Nothing was changed. Tick rows and click 'Review / Pending fixes' whenever you are ready." }
         }
     }
     function Invoke-GuiFix([int[]]$nos, [switch]$NoAsk) {
@@ -2647,7 +2663,7 @@ function Start-Gui {
             $msg = "The tool will make these changes on this PC:`r`n`r`n"
             foreach ($n in $nos) { $msg += "[$($ByNo[$n].DisplayNo)] $($ByNo[$n].Title)`r`n      -> $($ByNo[$n].Plan)`r`n" }
             $msg += "`r`nNo DSS installation snapshot is created. Existing PATH/hosts repair safeguards remain."
-            if (-not $IsAdmin) { $msg += "`r`n`r`nThis needs administrator rights: Windows will ask for permission, then the tool reopens as administrator and continues." }
+            if (-not $IsAdmin) { $msg += "`r`n`r`nThis needs administrator rights: Reopen Windows PowerShell as Administrator before applying repairs." }
             $msg += "`r`n`r`nContinue?"
             if ([Windows.Forms.MessageBox]::Show($msg, 'Permission to fix', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question) -ne 'Yes') { return }
         }
@@ -2657,10 +2673,15 @@ function Start-Gui {
             return
         }
         foreach ($d in (Get-Failed)) { if ($nos -notcontains $d.No) { $d.R.Status = 'SKIP' } }
-        Set-Busy $true; $G.LogMode = $true; $G.Txt.Clear(); $G.Sub.Text = 'Fixing ... please wait (Java / installer downloads can take a few minutes)'
-        Invoke-Fixes $nos
-        Say ''; Say 'Testing again ...' 'White'
-        [void](Invoke-StartupSequence -FullCheck); [void](Save-Results); Set-Busy $false; Update-Summary
+        $script:CancelRequested=$false; $script:RepairRunning=$true
+        try {
+            Set-Busy $true; $G.LogMode = $true; $G.Txt.Clear(); $G.Sub.Text = 'Applying reviewed fixes. Cancel remaining fixes stops the queue after the current operation.'
+            Invoke-Fixes $nos
+            $script:RepairRunning=$false; $G.BCancel.Enabled=$false
+            Say ''; Say 'Testing again ...' 'White'
+            [void](Invoke-StartupSequence -FullCheck); [void](Save-Results)
+        } finally {$script:RepairRunning=$false; Set-Busy $false; Update-Summary}
+        if($script:CancelRequested){$G.Sub.Text='Remaining fixes cancelled. Completed work was rechecked; review pending items when ready.';return}
         Invoke-InstallerCheckGui
         $fails = @(Get-Failed)
         if ($Results['4'].Status -in 'OK', 'FIXED', 'WARN') {
@@ -2672,7 +2693,7 @@ function Start-Gui {
     # ---- events
     $lv.Add_ItemCheck({ param($s, $e) $d = $ByNo[[int]$s.Items[$e.Index].Tag]; if (-not ($d.R.Status -in 'FAIL', 'SKIP' -or ($d.R.Status -eq 'WARN' -and $d.R.Fixable))) { $e.NewValue = 'Unchecked' } })
     $lv.Add_SelectedIndexChanged({ Invoke-UiSafe { Show-Detail } })
-    $G.BTest.Add_Click({ Invoke-UiSafe { Invoke-GuiTest -Full; Show-Detail } })
+    $G.BTest.Add_Click({ Invoke-UiSafe { Invoke-GuiTest -Full; Show-Detail; Show-InitialPendingReview } })
     $G.BCertificate.Add_Click({ Invoke-UiSafe { Show-SignerCertificateHelp -UseGui } })
     $G.BJavaUpdate.Add_Click({ Invoke-UiSafe {
         if (-not $IsAdmin) { [void][Windows.Forms.MessageBox]::Show('Reopen this tool in an Administrator PowerShell session and select Update Java.', 'Optional Java update'); return }
@@ -2682,6 +2703,14 @@ function Start-Gui {
         finally { Set-Busy $false }
     } })
     $f.Add_FormClosed({ $script:UiJavaOffer = $null; $script:G.JavaTimer.Stop(); $script:G.JavaTimer.Dispose(); $script:G.Flash.Stop(); $script:G.Flash.Dispose() })
+    $G.BCancel.Add_Click({ Invoke-UiSafe {
+        $script:CancelRequested=$true; $script:G.BCancel.Enabled=$false
+        $script:G.Stat.Text='Cancel requested. The current operation will finish; remaining fixes will be skipped.'
+        Write-DscEvent 'Info' 'Remaining repairs cancelled by user' @{}
+    } })
+    $f.Add_FormClosing({ param($sender,$eventArgs)
+        if($script:G.Busy){$eventArgs.Cancel=$true;$script:G.Stat.Text='An operation is active. Use Cancel remaining fixes, or wait for checks to finish.'}
+    })
     $G.BClose.Add_Click({ Invoke-UiSafe { $script:G.Form.Close() } })
     $G.BReport.Add_Click({ Invoke-UiSafe { $rp = Save-Results; Start-Process $rp } })
     $G.BGitHub.Add_Click({ Invoke-UiSafe { Save-DscSession $Results; Show-DscGitHubReport -UseGui } })
@@ -2797,19 +2826,16 @@ function Start-Gui {
             $script:G.Sub.Text = "Reopened as administrator to fix: $($hand -join ', ') - testing again first ..."
             Invoke-GuiTest -Full
             $todo = @(Get-Fixable | Where-Object { $hand -contains $_.No } | ForEach-Object { $_.No })
-            if ($todo.Count) { $script:G.Sub.Text="Diagnostics complete. Review proposed fixes to continue after elevation." }
+            if ($todo.Count) { $script:G.Sub.Text="Diagnostics complete. Review / Pending fixes to continue after elevation." }
             else { [void][Windows.Forms.MessageBox]::Show('Nothing left to fix - it already works.', 'Fix', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) }
         } else {
             $script:G.Sub.Text = 'Step 1: opening isLive; expiry-only alerts are warnings. Continuing the ordered checks ...'
             Invoke-GuiTest
             Show-Detail
-            # Initial diagnostics stay read-only. Offer a separate, default-No install action.
-            if ($ByNo[3].Last.NotInstalled -and $Cfg.AllowDssDownload -and $Cfg.PackageUrl -and -not $script:DssInstallOffered) {
-                $script:DssInstallOffered=$true
-                Invoke-DssInstallAndContinueGui
-            }
+            # Pending repairs are presented together after the first complete diagnostic run.
         }
         Show-Detail
+        Show-InitialPendingReview
     } })
     [void]$f.ShowDialog()
 }
