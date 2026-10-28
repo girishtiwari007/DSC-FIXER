@@ -101,3 +101,8 @@ The user's backup instruction applies only to repository source files before edi
 Copyright (c) 2026 Girish Tiwari. All rights reserved. See [LICENSE.txt](LICENSE.txt) for permitted use. Source remains readable; these terms are not copy protection. Existing third-party rights remain unchanged.
 
 The scripts remain unsigned pending a code-signing certificate. See [SIGNING.md](SIGNING.md) for the release signing and verification steps. The download-and-evaluate command above does not verify Authenticode signatures.
+
+
+## GUI download, install and continue
+
+After initial diagnostics, a missing DSS installation offers one explicit approval to download/reuse, validate, silently install DSS 4.1.8, and continue the ordered checks. The Download + install DSS button retries this workflow. No is the default. Run as Administrator for installation. Other repairs still require their own review. Check-only mode never installs. The existing direct source is tried first, followed automatically by the approved Google Drive fallback (file ID 13TrQwUAevLNBgAnR5VF4Hmd4E2-wSwtm). Both sources are shown in the approval prompt. HTML/login responses are rejected; package and mapped MSI validation remain required. Download errors show the source and failure reason; MSI diagnostics remain in dss-install.log. Repository-source backups are developer-side only.

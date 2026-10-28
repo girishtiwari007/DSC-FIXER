@@ -100,7 +100,7 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
         Assert-Workflow (-not (Prepare-DscInstaller) -and $script:PackageReads -eq 0) "$label working installation needs no package"
         function Get-DownloadsFolder {Join-Path $fixtureRoot 'Downloads'}
         function Confirm-DssDownload {return $true}
-        function Get-WebFileResume {param($url,$outFile)$script:Downloads++;[IO.File]::WriteAllText($outFile,'fixture package');@{Ok=$true}}
+        function Get-WebFileResume {param($url,$outFile)$script:Downloads++;[IO.File]::WriteAllBytes($outFile,[byte[]]@(0x50,0x4B,3,4,0,0,0,0));@{Ok=$true}}
         function Test-PackagePath {param($p)@{Kind='zip';Path=$p;Version='4.1.8'}}
         function Get-FileHash {param($LiteralPath,$Algorithm)$sha=[Security.Cryptography.SHA256]::Create();try{@{Hash=[BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($LiteralPath))).Replace('-','')}}finally{$sha.Dispose()}}
         $TestMode=$false;$Cfg.AllowDssDownload=$false;$Cfg.PackageUrl='https://example.invalid/fixture.zip'
@@ -112,7 +112,7 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
         $Cfg.PackageSha256=('0'*64);$threw=$false
         try{[void](Get-DssPackageFromWeb)}catch{$threw=$true}
         Assert-Workflow $threw "$label mismatched package hash is rejected"
-        $quarantine=Join-Path (Get-DownloadsFolder) ('DSC-Signer-4.1.8\DSS-4.1.8-' + $script:DscSession.SessionId + '.zip.rejected')
+        $quarantine=Join-Path (Get-DownloadsFolder) ('DSC-Signer-4.1.8\DSS-4.1.8-' + $script:DscSession.SessionId + '-source1.zip.rejected')
         Assert-Workflow (Test-Path -LiteralPath $quarantine) "$label hash-rejected archive cannot be rediscovered as an installer ZIP"
         $Cfg.PackageSha256='';$script:ValidPackage=$false;$threw=$false
         try{[void](Get-DssPackageFromWeb)}catch{$threw=$true}

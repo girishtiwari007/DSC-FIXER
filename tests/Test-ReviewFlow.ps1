@@ -92,13 +92,13 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
     Assert-Review ($script:GuiRepairs -eq 0 -and -not $script:ReviewApproved) 'closing the actual review modal applies no repair'
     $Cfg.AllowDssDownload=$true;$Cfg.PackageUrl='https://example.invalid/fixture.zip'
     $script:PackageRequests=0;$script:LocalMappingDialogs=0;$script:DeclinedNotices=0;$script:PackageApproved=$true
-    function Start-DssPackageRequest {$script:PackageRequests++;return $script:PackageApproved}
+    function Start-DssInstallRequest {$script:PackageRequests++;$script:DssInstallOutcome=$(if($script:PackageApproved){'Installed'}else{'Declined'});return $script:PackageApproved}
     $getInstallerClick=$G.BLocate.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic')
     [void]$getInstallerClick.Invoke($G.BLocate,@([EventArgs]::Empty))
-    Assert-Review ($script:PackageRequests -eq 1 -and $script:LocalMappingDialogs -eq 0) 'actual Get DSS installer button routes approved requests without a mapping dialog'
+    Assert-Review ($script:PackageRequests -eq 1 -and $script:LocalMappingDialogs -eq 0) 'actual download/install button routes approved requests and continues without a mapping dialog'
     $script:PackageApproved=$false
     [void]$getInstallerClick.Invoke($G.BLocate,@([EventArgs]::Empty))
-    Assert-Review ($script:PackageRequests -eq 2 -and $script:LocalMappingDialogs -eq 0 -and $script:DeclinedNotices -eq 1) 'actual declined GUI request does not fall back to manual mapping'
+    Assert-Review ($script:PackageRequests -eq 2 -and $script:LocalMappingDialogs -eq 0 -and $script:DeclinedNotices -eq 0) 'actual declined GUI request does not fall back to manual mapping'
     $G.JavaTimer.Dispose();$G.Flash.Dispose();$f.Dispose()
 '@)
   . ([scriptblock]::Create($gui))

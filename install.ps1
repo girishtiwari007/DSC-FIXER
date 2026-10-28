@@ -184,7 +184,7 @@ $TestRoot = $env:DSSF_TESTROOT
 $TestMode = -not [string]::IsNullOrEmpty($TestRoot)
 $CheckOnly = ($RequestedMode -eq 'check')
 $Mode = $(if ($RequestedMode -eq 'gui') { 'gui' } else { 'console' })
-$script:Ui = $null; $script:UiJavaOffer = $null
+$script:Ui = $null; $script:UiJavaOffer = $null; $script:DssInstallOffered=$false
 $script:UiLog = $null
 $script:UiStatus = $null
 $script:UiRow = $null
@@ -210,6 +210,7 @@ $Cfg = [ordered]@{
     # optional: where to download the 4.1.8 installer zip if it is not on this PC (set by install.ps1 / GitHub)
     AllowDssDownload    = $true
     PackageUrl          = 'https://nr.indianrailways.gov.in/uploads/files/1792736602773-DSC_Signer_Tool_with_DSS_4.1.8.zip'
+    PackageFallbackUrl  = 'https://drive.usercontent.google.com/download?id=13TrQwUAevLNBgAnR5VF4Hmd4E2-wSwtm&export=download&confirm=t'
     PackageSha256       = ''
 }
 # where DigitalSignerService 4.1.8 lives on a normal install - checked FIRST for item 3
@@ -768,39 +769,61 @@ function Export-BatPayload([string]$Bat, [string]$OutZip) {
 # Accepts a zip that holds the msi, OR a zip that holds the single-file tool (.bat with the installer inside).
 function Get-DssPackageFromWeb {
     if (-not $Cfg.AllowDssDownload -or -not $Cfg.PackageUrl) { return $false }
-    if(-not (Confirm-DssDownload)){return $false}
-    $downloadDir = Join-Path (Get-DownloadsFolder) 'DSC-Signer-4.1.8'
+    if (-not (Confirm-DssDownload)) { return $false }
+    $downloadDir=Join-Path (Get-DownloadsFolder) 'DSC-Signer-4.1.8'
     [void][IO.Directory]::CreateDirectory($downloadDir)
-    $zip = Join-Path $downloadDir ('DSS-4.1.8-' + $script:DscSession.SessionId + '.zip')
-    Say "      Downloading the DigitalSignerService $($Cfg.DssVersion) package from $($Cfg.PackageUrl) (about 100 MB) ..."
-    if ($TestMode -and $Cfg.PackageUrl -notmatch '^https?:') { Copy-Item -LiteralPath $Cfg.PackageUrl -Destination $zip }
-    else {
-        $r = Get-WebFileResume $Cfg.PackageUrl $zip
-        if (-not $r.Ok) { Say "      Download failed: $($r.Text)" 'Red'; Say "      Use 'Locate installer' to pick the zip / msi if you have it on this PC or a pen drive." 'Yellow'; return $false }
-    }
-    if ($Cfg.PackageSha256) {
-        $h = Get-DssSha256 $zip
-        if ($h -ne $Cfg.PackageSha256.ToUpper()) { Move-Item -LiteralPath $zip -Destination ($zip + '.rejected') -Force -ErrorAction Stop; throw 'Installer package SHA256 mismatch. Archive quarantined with .rejected extension.' }
-    }
-    $x = Test-PackagePath $zip
-    if (-not $x) {
-        $dir = Join-Path $RunDir ('web-package-'+[guid]::NewGuid().ToString('N'))
-        try { Expand-DssArchive -LiteralPath $zip -DestinationPath $dir -Force } catch { Write-DscError $_ 'Caught exception'; Say "      The download is not a usable zip: $($_.Exception.Message)" 'Red'; return $false }
-        if (-not (Find-InFolder $dir)) {
-            foreach ($bat in @(Get-ChildItem -LiteralPath $dir -Recurse -File -Filter *.bat | Where-Object { $_.Length -gt 1MB })) {
-                $pz = Join-Path $dir 'payload.zip'
-                if (Export-BatPayload $bat.FullName $pz) { Expand-DssArchive -LiteralPath $pz -DestinationPath (Join-Path $dir 'payload') -Force; Remove-Item -LiteralPath $pz -Force; break }
+    $sources=@($Cfg.PackageUrl)
+    if($Cfg.PackageFallbackUrl -and $Cfg.PackageFallbackUrl -ne $Cfg.PackageUrl){$sources+= $Cfg.PackageFallbackUrl}
+    $failures=@();$attempt=0
+    foreach($url in $sources){
+        $attempt++
+        $zip=Join-Path $downloadDir ('DSS-4.1.8-'+$script:DscSession.SessionId+'-source'+$attempt+'.zip')
+        try {
+            Say "      Downloading DSS $($Cfg.DssVersion), source $attempt of $($sources.Count): $url" 'Cyan'
+            if($TestMode -and $url -notmatch '^https?:'){Copy-Item -LiteralPath $url -Destination $zip}
+            else {
+                $download=Get-WebFileResume $url $zip
+                if(-not $download.Ok){throw ('Download failed: '+$download.Text)}
             }
+            # Reject HTML sign-in/confirmation pages before extraction or execution.
+            $stream=[IO.File]::OpenRead($zip)
+            try{$signature=New-Object byte[] 4;$read=$stream.Read($signature,0,4)}finally{$stream.Dispose()}
+            if($read -lt 4 -or $signature[0] -ne 0x50 -or $signature[1] -ne 0x4B){throw 'The source did not return a ZIP archive. A sign-in, permission or confirmation page may have been returned.'}
+            if($Cfg.PackageSha256 -and (Get-DssSha256 $zip) -ne $Cfg.PackageSha256.ToUpper()){
+                Move-Item -LiteralPath $zip -Destination ($zip+'.rejected') -Force
+                throw 'Installer package SHA256 mismatch. Archive quarantined.'
+            }
+            $candidate=$zip
+            if(-not (Test-PackagePath $candidate)){
+                $dir=Join-Path $RunDir ('web-package-'+[guid]::NewGuid().ToString('N'))
+                Expand-DssArchive -LiteralPath $zip -DestinationPath $dir -Force
+                if(-not (Find-InFolder $dir)){
+                    foreach($bat in @(Get-ChildItem -LiteralPath $dir -Recurse -File -Filter *.bat | Where-Object {$_.Length -gt 1MB})){
+                        $payload=Join-Path $dir 'payload.zip'
+                        if(Export-BatPayload $bat.FullName $payload){Expand-DssArchive -LiteralPath $payload -DestinationPath (Join-Path $dir 'payload') -Force;Remove-Item -LiteralPath $payload -Force;break}
+                    }
+                }
+                $mapped=Find-InFolder $dir
+                if(-not $mapped -or ($mapped.Version -and $mapped.Version -ne $Cfg.DssVersion)){throw "Downloaded package does not contain DSS $($Cfg.DssVersion)."}
+                $candidate=$mapped.Path
+            }
+            $valid=Test-PackageValid $candidate
+            if(-not $valid.Ok){throw ('Downloaded installer validation failed: '+$valid.Text)}
+            $script:PkgOverride=$candidate;$script:PkgMsi=$null;$script:PkgSkipped=$false
+            $script:DssPackageFailure=''
+            Write-DscEvent 'Info' 'DSS package downloaded and validated' @{Source=$url;Path=$candidate}
+            Say '      Package saved under Downloads and automatically validated.' 'Green'
+            return $true
+        } catch {
+            $reason="Source $attempt ($url): $($_.Exception.Message)"
+            $failures+=$reason
+            Write-DscError $_ 'DSS package source failed'
+            Write-DscEvent 'Warning' 'DSS package fallback' @{Source=$url;Reason=$_.Exception.Message}
+            Say ("      $reason" + $(if($attempt -lt $sources.Count){' Trying the approved fallback ...'}else{''})) 'Yellow'
         }
-        $m = Find-InFolder $dir
-        if (-not $m -or ($m.Version -and $m.Version -ne $Cfg.DssVersion)) { Say "      The downloaded package does not contain DigitalSignerService $($Cfg.DssVersion)." 'Red'; return $false }
-        $zip = $m.Path
     }
-    $validation = Test-PackageValid $zip
-    if (-not $validation.Ok) { throw ('Downloaded installer validation failed: ' + $validation.Text) }
-    Say '      Package downloaded to Downloads and automatically validated.' 'Cyan'
-    $script:PkgOverride = $zip; $script:PkgMsi = $null; $script:PkgSkipped = $false
-    return $true
+    $script:DssPackageFailure=$failures -join "`r`n"
+    throw ('No valid DSS installer could be downloaded. '+$script:DssPackageFailure)
 }
 function Get-DssPackageMsi {
     if($script:PkgMsi -and (Test-Path -LiteralPath $script:PkgMsi)){
@@ -2003,7 +2026,7 @@ function Request-ConsoleReview($Fixable) {
 
 function Read-DssDownloadApproval([string]$Message) {
     if($Mode -eq 'gui') {
-        return ([Windows.Forms.MessageBox]::Show($Message,'Permission to download DSS 4.1.8',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Question,[Windows.Forms.MessageBoxDefaultButton]::Button2) -eq 'Yes')
+        return ([Windows.Forms.MessageBox]::Show($Message,'DSS 4.1.8 - permission to continue',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Question,[Windows.Forms.MessageBoxDefaultButton]::Button2) -eq 'Yes')
     }
     Say $Message 'Yellow'
     return ((Ask '   Download DSS 4.1.8 now? [Y/N] : ' @('Y','N') 'N') -eq 'Y')
@@ -2017,15 +2040,68 @@ function Get-DssSha256([string]$LiteralPath) {
 function Confirm-DssDownload {
     if($CheckOnly -or ($script:DiagnosticsOnly -and -not $script:ReviewApproved)){return $false}
     if(-not $Cfg.AllowDssDownload -or -not $Cfg.PackageUrl){return $false}
-    $key="$($Cfg.DssVersion)|$($Cfg.PackageUrl)|$($Cfg.PackageSha256)"
+    $key="$($Cfg.DssVersion)|$($Cfg.PackageUrl)|$($Cfg.PackageSha256)|$($Cfg.PackageFallbackUrl)"
     if($script:DssDownloadConsentKey -eq $key -and $script:DssDownloadConsent -eq 'Granted'){return $true}
     if($script:DssDownloadConsentKey -eq $key -and $script:DssDownloadConsent -eq 'Declined'){return $false}
     $script:DssDownloadConsentKey=$key
-    $message="Download DigitalSignerService $($Cfg.DssVersion) (about 100 MB)?`r`nSource: $($Cfg.PackageUrl)`r`nThe package will be saved under your Downloads folder, validated and mapped automatically. Downloading does not install it. Installation still requires your reviewed Apply action."
+    $message="Download DigitalSignerService $($Cfg.DssVersion) (about 100 MB)?`r`nSource: $($Cfg.PackageUrl)`r`nFallback: $($Cfg.PackageFallbackUrl)`r`nThe package will be saved under your Downloads folder, validated and mapped automatically. Downloading does not install it. Installation still requires your reviewed Apply action."
     $approved=Read-DssDownloadApproval $message
     $script:DssDownloadConsent=$(if($approved){'Granted'}else{'Declined'})
     Write-DscEvent 'Info' 'DSS download permission' @{Approved=[bool]$approved;Source=$Cfg.PackageUrl}
     return [bool]$approved
+}
+function Start-DssInstallRequest {
+    $script:DssInstallOutcome = 'Failed'
+    $script:DssPackageFailure = ''
+    if ($CheckOnly) { $script:DssInstallOutcome='Unavailable'; return $false }
+    if (-not $IsAdmin) {
+        $script:DssPackageFailure='Open Windows PowerShell as Administrator and run the tool again. No installation was started.'
+        return $false
+    }
+    if (-not $Cfg.AllowDssDownload -or -not $Cfg.PackageUrl) {
+        $script:DssPackageFailure='Installer downloads are disabled. No installation was started.'
+        return $false
+    }
+    $message = "Download and install DigitalSignerService $($Cfg.DssVersion), then continue checks?`r`n`r`nSource: $($Cfg.PackageUrl)`r`nFallback: $($Cfg.PackageFallbackUrl)`r`nThe tool will reuse a validated package or download it to Downloads, validate and map the MSI, stop DSS if necessary, remove older DSS versions if present, and install silently. No other repairs are included. A restart may be required.`r`n`r`nChoose Yes to apply these changes now, or No to leave the installation unchanged."
+    if (-not (Read-DssDownloadApproval $message)) {
+        $script:DssInstallOutcome='Declined'
+        Write-DscEvent 'Info' 'DSS install and continue declined' @{}
+        return $false
+    }
+    $previousDiagnostics=$script:DiagnosticsOnly
+    $previousReview=$script:ReviewApproved
+    try {
+        $script:DiagnosticsOnly=$false; $script:ReviewApproved=$true
+        $script:DssDownloadConsentKey="$($Cfg.DssVersion)|$($Cfg.PackageUrl)|$($Cfg.PackageSha256)|$($Cfg.PackageFallbackUrl)"
+        $script:DssDownloadConsent='Granted'
+        Write-DscEvent 'Info' 'DSS install and continue approved' @{Source=$Cfg.PackageUrl;Check=3}
+        Say 'Downloading or reusing the installer, validating, then installing DSS silently ...' 'Cyan'
+        # Invoke the shared repair directly so a failed download cannot stop/remove DSS.
+        $definition=$ByNo[3]
+        $before=Test-DssInstall
+        if ($before.Pass -and -not $before.Warn) {
+            $script:DssInstallOutcome='AlreadyInstalled'
+            Say 'DSS 4.1.8 is already installed correctly; continuing checks without reinstalling.' 'Green'
+            return $true
+        }
+        Repair-DssInstall $definition.R $before
+        $after=Test-DssInstall
+        if (-not $after.Pass) { throw 'The installer finished but DSS 4.1.8 installation validation did not pass. See dss-install.log and the installation row.' }
+        $definition.Fixed=$true
+        $script:DssInstallOutcome='Installed'
+        Write-DscEvent 'Info' 'DSS install completed' @{Check=3}
+        return $true
+    } catch {
+        $reason=$_.Exception.Message
+        if ($script:DssPackageFailure) { $reason=$script:DssPackageFailure + ' ' + $reason }
+        $script:DssPackageFailure=$reason
+        Write-DscError $_ 'DSS install and continue'
+        Add-Detail $Results['3'] ('Download/install failed: ' + $reason)
+        return $false
+    } finally {
+        $script:DiagnosticsOnly=$previousDiagnostics
+        $script:ReviewApproved=$previousReview
+    }
 }
 function Start-DssPackageRequest {
     # Called only by an explicit Get installer / package action, never diagnostics.
@@ -2367,7 +2443,7 @@ function Start-Gui {
     }
     $G.BTest = New-Btn 'Run full check' 115
     $G.BFix = New-Btn 'Review proposed fixes ...' 185
-    $G.BLocate = New-Btn 'Get DSS installer ...' 145
+    $G.BLocate = New-Btn 'Download + install DSS ...' 185
     $G.BOpen = New-Btn 'Open DSC isLive Service Test-Check in browsers' 330
     $G.BOpen.BackColor = [Drawing.Color]::FromArgb(255, 221, 0); $G.BOpen.UseVisualStyleBackColor = $false
     $G.BOpen.Font = (New-UiFont 'Segoe UI Semibold' 9.5)
@@ -2597,13 +2673,21 @@ function Start-Gui {
     $G.BReport.Add_Click({ Invoke-UiSafe { $rp = Save-Results; Start-Process $rp } })
     $G.BGitHub.Add_Click({ Invoke-UiSafe { Save-DscSession $Results; Show-DscGitHubReport -UseGui } })
     $G.BImprove.Add_Click({ Invoke-UiSafe { Save-DscSession $Results; Show-DscGitHubReport -Kind Improvement -UseGui } })
+    function Invoke-DssInstallAndContinueGui {
+        Set-Busy $true; $script:G.LogMode=$true
+        try {
+            $installed=Start-DssInstallRequest
+            if ($installed) {
+                $script:G.Sub.Text='DSS installation validated. Continuing the ordered checks ...'
+                Invoke-GuiTest -Full; Show-Detail
+            } elseif ($script:DssInstallOutcome -ne 'Declined') {
+                [void][Windows.Forms.MessageBox]::Show($script:DssPackageFailure + "`r`n`r`nSession logs: " + $script:DscSessionDirectory, 'DSS download / installation failed', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning)
+            }
+        } finally { Set-Busy $false; Update-Summary; [void](Save-Results) }
+    }
     $G.BLocate.Add_Click({ Invoke-UiSafe {
         if($Cfg.AllowDssDownload -and $Cfg.PackageUrl){
-            Set-Busy $true
-            try {
-                if(Start-DssPackageRequest){Invoke-GuiTest -Full;Show-Detail}
-                else {[void][Windows.Forms.MessageBox]::Show('Download was not approved or no valid package was obtained. No installation was changed. See the log or retry Get DSS installer.', 'DSS installer')}
-            } finally {Set-Busy $false;Update-Summary}
+            Invoke-DssInstallAndContinueGui
             return
         }
         $res = Show-PackageDialog
@@ -2706,6 +2790,11 @@ function Start-Gui {
             $script:G.Sub.Text = 'Step 1: opening isLive; expiry-only alerts are warnings. Continuing the ordered checks ...'
             Invoke-GuiTest
             Show-Detail
+            # Initial diagnostics stay read-only. Offer a separate, default-No install action.
+            if ($ByNo[3].Last.NotInstalled -and $Cfg.AllowDssDownload -and $Cfg.PackageUrl -and -not $script:DssInstallOffered) {
+                $script:DssInstallOffered=$true
+                Invoke-DssInstallAndContinueGui
+            }
         }
         Show-Detail
     } })
