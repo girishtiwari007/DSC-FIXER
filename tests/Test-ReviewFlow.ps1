@@ -70,6 +70,23 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
   $gui=$gui.Replace('[void]$f.ShowDialog()',@'
     foreach($definition in $Defs){& $script:UiRow $definition}
     Assert-Review ($G.List.CheckedItems.Count -eq 0) 'no repair checkbox is preselected after diagnosis'
+    Assert-Review ($f.TopMost -and $G.PinTop.Checked) 'GUI stays above the browser by default'
+    $G.PinTop.Checked=$false
+    Assert-Review (-not $f.TopMost) 'user can unpin GUI for external Windows permission prompts'
+    $G.PinTop.Checked=$true
+    & $script:UiProgress 'begin-checks' $null 10
+    & $script:UiProgress 'checking' $ByNo[4] 0
+    Assert-Review ($G.Battery.Value -eq 0 -and $G.Target.Text.Contains('https://')) 'active check displays its target without counting it complete'
+    & $script:UiProgress 'checked' $ByNo[4] 0
+    & $script:UiProgress 'checked' $ByNo[4] 0
+    Assert-Review ($G.Battery.Value -eq 10 -and $G.ProgressDone.Count -eq 1) 'duplicate row events do not inflate progress'
+    & $script:UiProgress 'begin-repairs' $null 2
+    & $script:UiProgress 'repairing' $ByNo[3] 0
+    Assert-Review ($G.ProgressPhase -eq 'Repairs' -and $G.Battery.Value -eq 0 -and $G.Target.Text.Contains('4.1.8')) 'repair phase resets battery and shows installation target'
+    & $script:UiProgress 'repaired' $ByNo[3] 0
+    Assert-Review ($G.Battery.Value -eq 50 -and $G.Prog.Value -eq 50) 'battery and status strip count completed repair attempts'
+    & $script:UiProgress 'cancelled' $null 0
+    Assert-Review ($G.Battery.Value -eq 50 -and $G.Stage.Text.Contains('cancelled')) 'cancellation keeps partial progress instead of claiming 100 percent'
     $onShown=$f.GetType().GetMethod('OnShown',[Reflection.BindingFlags]'Instance,NonPublic')
     [void]$onShown.Invoke($f,@([EventArgs]::Empty))
     Assert-Review ($script:GuiDiagnostics -eq 1 -and $script:GuiReview -eq 1 -and $script:GuiRepairs -eq 0) 'actual GUI startup completes diagnostics then opens review without repairs'
