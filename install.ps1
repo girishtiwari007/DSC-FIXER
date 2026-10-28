@@ -1013,48 +1013,61 @@ function Ask([string]$q, [string[]]$valid, [string]$def) {
 #  CHECK 6 - hosts file
 # =====================================================================
 function Test-Hosts {
-    $info = @(); $path = Get-HostsPath; $h = [regex]::Escape($Cfg.SignerHost)
-    try { $lines = [IO.File]::ReadAllLines($path) } catch { Write-DscError $_ 'Caught exception'; return @{ Pass = $false; Info = @("hosts file cannot be read ($($_.Exception.Message))"); Advice = 'Antivirus / policy is blocking the hosts file. Allow C:\Windows\System32\drivers\etc\hosts in the antivirus (hosts-file protection) and run again.' } }
-    $good = 0; $bad = @()
-    foreach ($l in $lines) {
-        if ($l -notmatch $h) { continue }
-        if ($l.Trim() -match "^127\.0\.0\.1\s+$h\s*(#.*)?$") { $good++ } else { $bad += $l.Trim() }
+    $path=Get-HostsPath; $hostName=$Cfg.SignerHost; $good=0; $bad=@(); $info=@()
+    try {$lines=[IO.File]::ReadAllLines($path)} catch {
+        Write-DscError $_ 'Read hosts diagnostic'
+        return @{Pass=$false;Info=@('hosts file could not be read: '+$_.Exception.Message);Advice='Run as administrator or ask IT to review hosts-file access.'}
     }
-    if ($good -eq 0) { $info += "no active '127.0.0.1 $($Cfg.SignerHost)' line" }
-    if ($good -gt 1) { $info += "entry repeated $good times" }
-    foreach ($b in $bad) { $info += "wrong/commented line: '$b'" }
-    $ips = @(Resolve-Signer)
-    $resolvesOk = ($ips.Count -gt 0 -and $ips[0] -eq '127.0.0.1')
-    if (-not $resolvesOk) { $info += "$($Cfg.SignerHost) resolves to '$($ips -join ',')' instead of 127.0.0.1" }
-    $pass = ($good -eq 1 -and $bad.Count -eq 0 -and $resolvesOk)
-    if ($pass) { $info = @("127.0.0.1 $($Cfg.SignerHost) present and resolving to 127.0.0.1") }
-    return @{ Pass = $pass; Info = $info; Value = $(if ($pass) { "127.0.0.1 $($Cfg.SignerHost)" } else { '' }); Advice = 'If the line keeps disappearing, the antivirus is restoring the hosts file - add an exclusion for it (e.g. Quick Heal / K7 / McAfee "hosts protection").' }
+    foreach($line in $lines){
+        $active=($line -split '#',2)[0].Trim()
+        if(-not $active){continue}
+        $tokens=@($active -split '\s+')
+        if($tokens.Count -gt 1 -and @($tokens | Select-Object -Skip 1) -contains $hostName){
+            if($tokens[0] -eq '127.0.0.1'){$good++}else{$bad+=$active}
+        }
+    }
+    $ips=@(Resolve-Signer)
+    $resolvesOk=$ips.Count -gt 0 -and @($ips | Where-Object {$_ -ne '127.0.0.1'}).Count -eq 0
+    if(-not $good){$info+="No active valid '127.0.0.1 $hostName' mapping was found."}
+    foreach($line in $bad){$info+=('Conflicting active mapping: '+$line)}
+    if(-not $resolvesOk){$info+="$hostName resolves to '$($ips -join ', ')' instead of only 127.0.0.1."}
+    $pass=$good -ge 1 -and $bad.Count -eq 0 -and $resolvesOk
+    if($pass){$info=@("$good active loopback mapping(s); $hostName resolves to 127.0.0.1.")}
+    return @{Pass=$pass;Info=$info;Value=$(if($pass){"127.0.0.1 $hostName"}else{''});Advice='Review and apply the hosts repair to create a separate loopback entry. Unrelated entries are preserved. If access is blocked, ask IT to review it.'}
 }
 function Repair-Hosts($r) {
-    $path = Get-HostsPath; $h = [regex]::Escape($Cfg.SignerHost)
-    Copy-Item -LiteralPath $path -Destination (Join-Path $RunDir 'hosts.backup') -Force -ErrorAction SilentlyContinue
-    try { $fi = Get-Item -LiteralPath $path -Force; if ($fi.Attributes -band [IO.FileAttributes]::ReadOnly) { $fi.Attributes = $fi.Attributes -bxor [IO.FileAttributes]::ReadOnly; Add-Action $r 'Removed read-only flag from hosts file' } } catch { Write-DscError $_ 'Caught exception';}
-    $lines = @(); try { $lines = [IO.File]::ReadAllLines($path) } catch { Write-DscError $_ 'Caught exception';}
-    $out = New-Object System.Collections.Generic.List[string]
-    foreach ($l in $lines) {
-        if ($l -match $h) {
-            $rest = [regex]::Replace($l, "(?:(?:\d{1,3}\.){3}\d{1,3}|::1|0\.0\.0\.0)?\s*$h", '')
-            if ($rest -match '^\s*#?\s*$' -or $rest -match '^\s*#?\s*[\d\.:a-fA-F]+\s*$') { continue }
-            $out.Add($rest.TrimEnd())
-        } else { $out.Add($l) }
+    $path=Get-HostsPath; $hostName=$Cfg.SignerHost; $h=[regex]::Escape($hostName)
+    # A readable, verified backup is required before changing the hosts file.
+    $lines=[IO.File]::ReadAllLines($path)
+    $backup=Join-Path $RunDir ('hosts.backup-'+[guid]::NewGuid().ToString('N'))
+    Copy-Item -LiteralPath $path -Destination $backup -ErrorAction Stop
+    if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash){throw 'Hosts backup verification failed. No hosts changes were made.'}
+    $out=New-Object 'Collections.Generic.List[string]'
+    foreach($line in $lines){
+        if($line.TrimStart().StartsWith('#')){$out.Add($line);continue}
+        # Recover a missing newline before the exact signer loopback entry.
+        # Example: 0.0.0.1 other.example127.0.0.1 eoffsigner.eoffice.gov.in
+        $parts=[regex]::Split($line,"(?<=\S)(?=127\.0\.0\.1\s+$h(?:\s|#|$))")
+        foreach($part in $parts){
+            $pieces=$part -split '#',2; $active=$pieces[0].Trim()
+            $tokens=@($active -split '\s+')
+            if($tokens.Count -gt 1 -and @($tokens | Select-Object -Skip 1) -contains $hostName){
+                $aliases=@($tokens | Select-Object -Skip 1 | Where-Object {$_ -ine $hostName})
+                $comment=$(if($pieces.Count -gt 1){'#'+$pieces[1]}else{''})
+                if($aliases.Count){$out.Add($tokens[0]+' '+($aliases -join ' ')+$(if($comment){' '+$comment}else{''}))}
+                elseif($comment){$out.Add($comment)}
+            }else{$out.Add($part)}
+        }
     }
-    while ($out.Count -gt 0 -and [string]::IsNullOrWhiteSpace($out[$out.Count - 1])) { $out.RemoveAt($out.Count - 1) }
-    $out.Add("127.0.0.1 $($Cfg.SignerHost)")
+    while($out.Count -gt 0 -and [string]::IsNullOrWhiteSpace($out[$out.Count-1])){$out.RemoveAt($out.Count-1)}
+    $out.Add("127.0.0.1 $hostName")
+    $file=Get-Item -LiteralPath $path -Force; $attributes=$file.Attributes
     try {
-        [IO.File]::WriteAllText($path, (($out -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
-        Add-Action $r "hosts file rewritten with '127.0.0.1 $($Cfg.SignerHost)' (old copy saved as hosts.backup)"
-    } catch { Write-DscError $_ 'Caught exception';
-        Add-Action $r "Could not write hosts file: $($_.Exception.Message)"
-        $r.Advice = 'Antivirus is blocking hosts file changes. Temporarily disable its hosts/system-file protection and run again.'
-        return
-    }
-    Start-Sleep -Seconds 2
-    if (-not $TestMode) { ipconfig /flushdns | Out-Null; Add-Action $r 'DNS cache flushed' }
+        if($attributes -band [IO.FileAttributes]::ReadOnly){$file.Attributes=$attributes -band (-bnot [IO.FileAttributes]::ReadOnly)}
+        [IO.File]::WriteAllText($path,($out -join "`r`n")+"`r`n",(New-Object Text.UTF8Encoding $false))
+    } finally { (Get-Item -LiteralPath $path -Force).Attributes=$attributes }
+    Add-Action $r "Hosts repaired with a separate '127.0.0.1 $hostName' line. Verified original backup: $backup"
+    if(-not $TestMode){ipconfig /flushdns | Out-Null;Add-Action $r 'DNS cache flushed'}
 }
 
 # =====================================================================
