@@ -1,4 +1,4 @@
-# Fixture-only tests: never alter Java, browser settings, or install software.
+﻿# Fixture-only tests: never alter Java, browser settings, or install software.
 $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSScriptRoot
 $source=[IO.File]::ReadAllText((Join-Path $root 'install.ps1'))
@@ -20,6 +20,7 @@ Assert-Other ((Get-OtherSiteSettingsUrl Edge 'https://ireps.gov.in') -like 'edge
 Assert-Other ((Get-OtherSiteSettingsUrl Firefox 'https://ireps.gov.in') -eq 'about:preferences#privacy') 'Firefox uses guided privacy settings'
 $TestMode=$false;$script:CancelRequested=$false;$script:Opened=@();$script:Logged=@()
 function Start-Process{param($FilePath,$ArgumentList,$ErrorAction)$script:Opened+=@{Exe=$FilePath;Url=$ArgumentList}}
+function Confirm-OtherBrowserSettings {param($Browser,$Origins) return $true}
 function Find-Browser($name){[pscustomobject]@{Exe=($name+'.exe')}}
 function Say{param($text,$color)}
 function Write-DscEvent{param($level,$operation,$data)$script:Logged+=$operation}
@@ -54,7 +55,7 @@ $IsAdmin=$true
 function Invoke-JavaVersion($exe){@{Code=1;Text='corrupt fixture'}}
 Invoke-OtherJavaRepair -Confirmed
 Assert-Other ($script:JavaRepairs -eq 1) 'broken shared Java enters approved repair path'
-Assert-Other ($source -match "'3' \{ Invoke-DscSelection 'othergui' \}" -and $source -match "'5' \{ return \}") 'menu Option 3 opens dedicated GUI and Option 5 exits'
+Assert-Other ($source -match "'3' \{ Invoke-DscSelection 'othergui' \}" -and $source -match "'6' \{ return \}") 'menu Option 3 opens dedicated GUI and Option 6 exits'
 # Construct the actual form, inspect defaults, then dispose without showing or repairing.
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 $gui=Function-Text 'Start-OtherGui'
@@ -68,5 +69,19 @@ Assert-Other ($o.Sites.Items.Count -eq 5) 'actual GUI shows only approved origin
 '@)
 $script:DscSessionDirectory='fixture-only';$script:Ui=$null;$script:UiStatus=$null;$script:UiLog=$null
 . ([scriptblock]::Create($gui));Start-OtherGui
-Assert-Other ((Function-Text 'Confirm-OtherUi') -match 'MessageBoxDefaultButton\]::Button2') 'GUI confirmation defaults to No'
+Assert-Other ((Function-Text 'Confirm-OtherUi') -match 'Show-OtherContinueDialog') 'all Option 3 confirmations use Continue / Cancel'
+$dialog=Function-Text 'Show-OtherContinueDialog'
+$dialog=$dialog.Replace('$result=$d.ShowDialog($script:OtherUi.Form)',@'
+Assert-Other ($continue.Text -eq 'Continue' -and $cancel.Text -eq 'Cancel') 'actual popup uses requested Continue / Cancel labels'
+Assert-Other ($d.AcceptButton -eq $cancel -and $d.CancelButton -eq $cancel -and $d.ActiveControl -eq $cancel) 'actual popup defaults Enter and Escape to Cancel'
+$result=[Windows.Forms.DialogResult]::Cancel
+'@)
+. ([scriptblock]::Create($dialog))
+Assert-Other (-not (Show-OtherContinueDialog 'Fixture selected websites only' 'Fixture browser reset')) 'Cancel returns no approval'
+$script:Opened=@();$script:Logged=@();$script:Prompted=@()
+function Confirm-OtherBrowserSettings {param($Browser,$Origins)$script:Prompted+=$Browser;return ($Browser -ne 'Chrome')}
+Open-OtherWebsiteSettings @('Chrome','Edge','Firefox') @('https://ireps.gov.in') -Confirmed
+Assert-Other ($script:Prompted.Count -eq 3) 'each selected installed browser receives its own prompt'
+Assert-Other ($script:Opened.Count -eq 2 -and -not ($script:Opened.Exe -contains 'Chrome.exe')) 'Cancel skips one browser and Continue opens the others'
+
 Write-Host "TOTAL PASS: $script:Passed"

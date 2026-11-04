@@ -90,7 +90,7 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
     $onShown=$f.GetType().GetMethod('OnShown',[Reflection.BindingFlags]'Instance,NonPublic')
     [void]$onShown.Invoke($f,@([EventArgs]::Empty))
     Assert-Review ($script:GuiDiagnostics -eq 1 -and $script:GuiReview -eq 1 -and $script:GuiRepairs -eq 0) 'actual GUI startup completes diagnostics then opens review without repairs'
-    Assert-Review ($f.Text.Contains('Test edition') -and $f.Text.Contains('Build 2026.11.04.1')) 'actual window title identifies edition and exact build'
+    Assert-Review ($f.Text.Contains('Test edition') -and $f.Text.Contains('Build 2026.11.04.2')) 'actual window title identifies edition and exact build'
     Assert-Review ($G.Live.Text.StartsWith('Signer service: WORKING') -and $G.Findings.Text.StartsWith('Other checks: 1 need attention')) 'actual dashboard shows service and other checks separately'
     Assert-Review ($G.BFix.Text -eq 'Review / Pending fixes ...') 'main action explicitly reviews before applying'
     $onClick=$G.BTest.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic')

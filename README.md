@@ -1,6 +1,6 @@
 # Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )
 
-> Current local build: **2026.11.04.1**. All editions now support permission-based DSS installer downloads. Earlier local-package-only capability notes below are superseded by the Download permission and repository backups section.
+> Current local build: **2026.11.04.2**. All editions now support permission-based DSS installer downloads. Earlier local-package-only capability notes below are superseded by the Download permission and repository backups section.
 
 Run in Windows PowerShell:
 
@@ -9,7 +9,7 @@ Run in Windows PowerShell:
 irm 'https://raw.githubusercontent.com/girishtiwari007/DSC-FIXER/main/install.ps1' | iex
 ```
 
-Choose 1 for the PowerShell console, 2 for the full Windows GUI, 3 for **Reset Java & setting for other Websites**, 4 to redraw the menu, or 5 to exit. Closing a mode returns to the menu. For repairs, open Windows PowerShell as Administrator first. Windows popups require STA (Windows PowerShell normally uses it).
+Choose 1 for the PowerShell console, 2 for the full Windows GUI, 3 for **Reset Java & setting for other Websites**, 4 to redraw the menu, 5 for the CRIS Signer Switcher & Installer, or 6 to exit. Closing a mode returns to the menu. For repairs, open Windows PowerShell as Administrator first. Windows popups require STA (Windows PowerShell normally uses it).
 
 The script runs directly in the current session and does not download or launch a batch application. It does not change antivirus settings or execution policy, and is not guaranteed to be accepted by Trellix. Ask IT to review any block. Logs, reports, backups and approved installer operations can still write files. The script is unsigned.
 
@@ -29,7 +29,7 @@ Each launch keeps a unique session under `%LOCALAPPDATA%\DSC-Signer-Fixer\sessio
 - `session.json`: tool version, session ID, mode, latest check statuses, action counts, error groups and unresolved-check follow-ups.
 - `github-report.md`: allowlisted preview suitable for optional GitHub submission. Application sessions also retain `fix-log.txt`, `result.json`, HTML reports and backups.
 
-Use **Report error ...** or **Suggest improvement ...** in the dashboard. Console mode offers the same choices after a run; the startup menu contains options 1-5 and displays the session-log folder. Check-only mode never prompts to report.
+Use **Report error ...** or **Suggest improvement ...** in the dashboard. Console mode offers the same choices after a run; the startup menu contains options 1-6 and displays the session-log folder. Check-only mode never prompts to report.
 
 To report a saved session later (including an offline session or launcher failure), download `Report-Session.ps1` from this repository and run:
 
@@ -115,3 +115,22 @@ Build 2026.11.04.1 adds a separate GUI for shared Java environment and execution
 Website actions start with all browsers and sites unchecked. Select Chrome, Firefox and/or Edge and the exact HRMS, IPAS, IREPS, UDM/IMMS or IRWCMS/IRCEP origins, then approve the default-No confirmation. Chrome/Edge open the selected origin's site settings; Firefox opens Privacy settings with instructions to use Manage Data and Page Info permissions for the selected hostname. Complete Delete data / Reset permissions in the browser. Site data deletion signs the user out and affects all paths on that origin. The tool never edits browser databases, clears all browsing data or reports a reset completed merely because settings opened.
 
 This mode does not repair DSS, certificates or ports. Cancel skips remaining work after the current operation completes. Repository source backups remain required; no user-side DSS installation backup is added. Run `tests/Test-OtherWebsiteGui.ps1` in Windows PowerShell with STA for isolated GUI and repair-flow fixtures.
+
+
+## Option 5: CRIS Signer Switcher & Installer
+
+The switcher checks exact executable paths and TCP port ownership: IPAS uses `C:\CrisSigner\CrisSigner_IPAS\CrisSigner.exe` on 2068; IRWCMS/IRCEP uses `C:\CrisSigner\CrisSigner_IRWCMS\CrisSigner.exe` on 2039. Green indicates verified process ownership of the listening port; red means stopped/missing; amber means starting, conflict or unverified ownership. Switching requires administrator rights and Continue approval, stops only the other identified executable, checks its port is released, then starts the selected signer. Unknown processes are never killed. Service-backed processes are blocked pending verified service configuration.
+
+The separate Installer / progress tab has one primary **Setup BOTH signers automatically** button. Non-admin sessions reopen through UAC. One Continue / Cancel review lists existing CRIS MSI products to remove and approves downloads, reinstall, scoped shortcut cleanup and validation. Both packages are downloaded and inspected and their transforms generated before any uninstall. Only exact inspected hashes and identities are accepted for the currently unsigned source packages; changed downloads stop before existing signers are removed. Installation order is scoped CRIS uninstall, IPAS installation, then IRWCMS installation. Source MSIs remain untouched; local MSTs rename their nested `CrisSigner_Dir` folders and desktop/start-menu entries, and suppress their conflicting generic startup links. MSI logs and CRIS-setup-state.json record partial outcomes. Cancellation waits for an active MSI; a reboot-required uninstall stops setup until restart.
+
+Setup creates **CRISSigner_IPAS**, **CRISSigner_IRWCMS**, and **CRIS Signer Switcher** on the current user's Desktop, requesting UAC. A verified source copy is retained in LOCALAPPDATA; in-memory launches preserve their current script body. Cleanup removes only ambiguous desktop shortcuts with exact known legacy/managed CRIS executable targets, preserving the new named shortcuts and unrelated links. Existing CRIS configuration may be replaced by approved reinstallation; this is disclosed in setup review. After installation, both ports are tested sequentially and IPAS is left active. If a reboot is required, runtime validation is deferred and reported explicitly. Downloaded MSI metadata and MST output were inspected offline; no actual vendor installation/uninstallation was executed during tests.
+
+
+### Inspected CRIS package copies (04 Nov 2026)
+
+| Application | MSI version | SHA256 |
+| --- | --- | --- |
+| IPAS | 1.4.0 | `9c96f5f1549a1fedbca2d242c420fe1a973fa394816b4b21e3e376a53661e424` |
+| IRWCMS / IRCEP | 1.4.0 | `aaa1c7aab92304ad0c0985add3561902fef2d6abf46e4ed602e8f8f8b339b442` |
+
+Both copies are unsigned. Pins identify the exact packages downloaded from the user-approved sources; they are not vendor signatures. Future source changes require fresh inspection before automatic setup.

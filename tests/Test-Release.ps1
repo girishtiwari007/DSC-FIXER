@@ -150,7 +150,7 @@ foreach ($file in $files) {
                 $doc=Get-Content (Join-Path $script:DscSessionDirectory 'session.json') -Raw | ConvertFrom-Json
                 Assert ($doc.State -eq 'Completed') "$label finalizes $modeName session"
             }
-            function Read-Host { param($Prompt) return '5' }
+            function Read-Host { param($Prompt) return '6' }
             & ([scriptblock]::Create($safe))
             Assert ($script:DscSession.State -eq 'Completed') "$label menu exit finalizes session"
         } $ast $source ($file.Directory.Name+'/'+$file.Name)
