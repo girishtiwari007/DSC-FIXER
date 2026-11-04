@@ -1,6 +1,6 @@
 # Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )
 
-> Current local build: **2026.10.27.3**. All editions now support permission-based DSS installer downloads. Earlier local-package-only capability notes below are superseded by the Download permission and repository backups section.
+> Current local build: **2026.11.04.1**. All editions now support permission-based DSS installer downloads. Earlier local-package-only capability notes below are superseded by the Download permission and repository backups section.
 
 Run in Windows PowerShell:
 
@@ -9,7 +9,7 @@ Run in Windows PowerShell:
 irm 'https://raw.githubusercontent.com/girishtiwari007/DSC-FIXER/main/install.ps1' | iex
 ```
 
-Choose 1 for the PowerShell console, 2 for Windows popups, 3 to redraw the menu, or 4 to exit. Closing a mode returns to the menu. For repairs, open Windows PowerShell as Administrator first. Windows popups require STA (Windows PowerShell normally uses it).
+Choose 1 for the PowerShell console, 2 for the full Windows GUI, 3 for **Reset Java & setting for other Websites**, 4 to redraw the menu, or 5 to exit. Closing a mode returns to the menu. For repairs, open Windows PowerShell as Administrator first. Windows popups require STA (Windows PowerShell normally uses it).
 
 The script runs directly in the current session and does not download or launch a batch application. It does not change antivirus settings or execution policy, and is not guaranteed to be accepted by Trellix. Ask IT to review any block. Logs, reports, backups and approved installer operations can still write files. The script is unsigned.
 
@@ -29,7 +29,7 @@ Each launch keeps a unique session under `%LOCALAPPDATA%\DSC-Signer-Fixer\sessio
 - `session.json`: tool version, session ID, mode, latest check statuses, action counts, error groups and unresolved-check follow-ups.
 - `github-report.md`: allowlisted preview suitable for optional GitHub submission. Application sessions also retain `fix-log.txt`, `result.json`, HTML reports and backups.
 
-Use **Report error ...** or **Suggest improvement ...** in the dashboard. Console mode offers the same choices after a run; the startup menu contains only options 1-4 and displays the session-log folder. Check-only mode never prompts to report.
+Use **Report error ...** or **Suggest improvement ...** in the dashboard. Console mode offers the same choices after a run; the startup menu contains options 1-5 and displays the session-log folder. Check-only mode never prompts to report.
 
 To report a saved session later (including an offline session or launcher failure), download `Report-Session.ps1` from this repository and run:
 
@@ -106,3 +106,12 @@ The scripts remain unsigned pending a code-signing certificate. See [SIGNING.md]
 ## GUI download, install and continue
 
 After initial diagnostics, a missing DSS installation offers one explicit approval to download/reuse, validate, silently install DSS 4.1.8, and continue the ordered checks. The Download + install DSS button retries this workflow. No is the default. Run as Administrator for installation. Other repairs still require their own review. Check-only mode never installs. The existing direct source is tried first, followed automatically by the approved Google Drive fallback (file ID 13TrQwUAevLNBgAnR5VF4Hmd4E2-wSwtm). Both sources are shown in the approval prompt. HTML/login responses are rejected; package and mapped MSI validation remain required. Download errors show the source and failure reason; MSI diagnostics remain in dss-install.log. Repository-source backups are developer-side only.
+
+
+## Option 3: Reset Java & setting for other Websites
+
+Build 2026.11.04.1 adds a separate GUI for shared Java environment and execution checks. Run Java checks, review the findings, then explicitly approve repairs. Working Java is retained regardless of age; the Optional Java update button checks vendor metadata and asks separately before installation. Release age is not inferred from installation dates. Missing or corrupted Java may require a download and installation after approval. Administrator rights are required for repairs.
+
+Website actions start with all browsers and sites unchecked. Select Chrome, Firefox and/or Edge and the exact HRMS, IPAS, IREPS, UDM/IMMS or IRWCMS/IRCEP origins, then approve the default-No confirmation. Chrome/Edge open the selected origin's site settings; Firefox opens Privacy settings with instructions to use Manage Data and Page Info permissions for the selected hostname. Complete Delete data / Reset permissions in the browser. Site data deletion signs the user out and affects all paths on that origin. The tool never edits browser databases, clears all browsing data or reports a reset completed merely because settings opened.
+
+This mode does not repair DSS, certificates or ports. Cancel skips remaining work after the current operation completes. Repository source backups remain required; no user-side DSS installation backup is added. Run `tests/Test-OtherWebsiteGui.ps1` in Windows PowerShell with STA for isolated GUI and repair-flow fixtures.
