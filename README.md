@@ -134,3 +134,8 @@ Setup creates **CRISSigner_IPAS**, **CRISSigner_IRWCMS**, and **CRIS Signer Swit
 | IRWCMS / IRCEP | 1.4.0 | `aaa1c7aab92304ad0c0985add3561902fef2d6abf46e4ed602e8f8f8b339b442` |
 
 Both copies are unsigned. Pins identify the exact packages downloaded from the user-approved sources; they are not vendor signatures. Future source changes require fresh inspection before automatic setup.
+
+
+## Optional browser bookmark and startup settings
+
+The existing Option 2 full GUI provides one optional **DSC islive Check - Bookmark / Startup setup** button. No additional startup-menu option or duplicate Option 3 action is added. Select Chrome, Edge and/or Firefox and choose bookmark and/or startup setup. Selections default unchecked and confirmations default Cancel. Each selected browser receives its own Continue / Cancel instructions. A one-link HTML import file is prepared for **DSC islive Check** after approval; the browser can import it or the user can bookmark the opened isLive page with Ctrl+D. Startup settings open for the user to append the DSC URL while retaining existing pages. Existing browser databases, organization policies and session-restore modes are never overwritten. Setup is recorded as pending user action, not as a verified saved setting. Certificate warnings and signer startup timing remain separate.
