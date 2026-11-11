@@ -26,6 +26,7 @@ foreach($case in @(
  @{Requested='gui';UiMode='gui';Expected='DSS'},
  @{Requested='crisgui';UiMode='gui';Expected='CRIS'},
  @{Requested='crisinstall';UiMode='gui';Expected='CRIS'},
+ @{Requested='crisswitch';UiMode='gui';Expected='CRIS'},
  @{Requested='othergui';UiMode='gui';Expected='Other'},
  @{Requested='console';UiMode='console';Expected='Console'}
 )) {

@@ -72,7 +72,7 @@ Assert-Cris ($source -match "'5' \{ Invoke-DscSelection 'crisgui' \}" -and $sour
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 $gui=Read-CrisFunction 'Start-CrisGui'
 $gui=$gui.Replace('[void]$f.ShowDialog()',@'
-Assert-Cris ($tabs.TabPages.Count -eq 2 -and $installPage.Text -eq 'Installer / progress') 'actual GUI separates switcher and installer views'
+Assert-Cris ($u.Setup.Text -match 'Install / Repair' -and $u.Refresh.Text -match 'Check / Refresh') 'actual GUI has two clear primary actions'
 Assert-Cris ($u.Rows.Count -eq 2 -and $u.Choice.Items.Count -eq 2) 'actual GUI exposes both signers only'
 Assert-Cris (-not $u.Busy -and -not $u.Cancel.Enabled) 'actual GUI opens idle without starting installation'
 Assert-Cris ($u.Progress.Style -eq 'Continuous' -and $u.Log.ReadOnly) 'actual GUI exposes progress and read-only action log'

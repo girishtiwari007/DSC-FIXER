@@ -121,7 +121,7 @@ This mode does not repair DSS, certificates or ports. Cancel skips remaining wor
 
 The switcher checks exact executable paths and TCP port ownership: IPAS uses `C:\CrisSigner\CrisSigner_IPAS\CrisSigner.exe` on 2068; IRWCMS/IRCEP uses `C:\CrisSigner\CrisSigner_IRWCMS\CrisSigner.exe` on 2039. Green indicates verified process ownership of the listening port; red means stopped/missing; amber means starting, conflict or unverified ownership. Switching requires administrator rights and Continue approval, stops only the other identified executable, checks its port is released, then starts the selected signer. Unknown processes are never killed. Service-backed processes are blocked pending verified service configuration.
 
-The separate Installer / progress tab has one primary **Setup BOTH signers automatically** button. Non-admin sessions reopen through UAC. One Continue / Cancel review lists existing CRIS MSI products to remove and approves downloads, reinstall, scoped shortcut cleanup and validation. Both packages are downloaded and inspected and their transforms generated before any uninstall. Only exact inspected hashes and identities are accepted for the currently unsigned source packages; changed downloads stop before existing signers are removed. Installation order is scoped CRIS uninstall, IPAS installation, then IRWCMS installation. Source MSIs remain untouched; local MSTs rename their nested `CrisSigner_Dir` folders and desktop/start-menu entries, and suppress their conflicting generic startup links. MSI logs and CRIS-setup-state.json record partial outcomes. Cancellation waits for an active MSI; a reboot-required uninstall stops setup until restart.
+The main screen has one primary **Install / Repair both + desktop switcher** action after **Check / Refresh status**. Non-admin sessions reopen through UAC. One Continue / Cancel review lists existing CRIS MSI products to remove and approves downloads, reinstall, scoped shortcut cleanup and validation. Both packages are downloaded and inspected and their transforms generated before any uninstall. Only exact inspected hashes and identities are accepted for the currently unsigned source packages; changed downloads stop before existing signers are removed. Installation order is scoped CRIS uninstall, IPAS installation, then IRWCMS installation. Source MSIs remain untouched; local MSTs rename their nested `CrisSigner_Dir` folders and desktop/start-menu entries, and suppress their conflicting generic startup links. MSI logs and CRIS-setup-state.json record partial outcomes. Cancellation waits for an active MSI; a reboot-required uninstall stops setup until restart.
 
 Setup creates **CRISSigner_IPAS**, **CRISSigner_IRWCMS**, and **CRIS Signer Switcher** on the current user's Desktop, requesting UAC. A verified source copy is retained in LOCALAPPDATA; in-memory launches preserve their current script body. Cleanup removes only ambiguous desktop shortcuts with exact known legacy/managed CRIS executable targets, preserving the new named shortcuts and unrelated links. Existing CRIS configuration may be replaced by approved reinstallation; this is disclosed in setup review. After installation, both ports are tested sequentially and IPAS is left active. If a reboot is required, runtime validation is deferred and reported explicitly. Downloaded MSI metadata and MST output were inspected offline; no actual vendor installation/uninstallation was executed during tests.
 
@@ -180,3 +180,18 @@ website ZIP contains that full script as Windows-Troubleshooter.ps1. A local rep
 launch uses the matching sibling engine without another download. After changing
 troubleshooter.ps1, run `powershell.exe -NoProfile -File .\tools\build-launcher.ps1`
 to update the launcher's embedded engine hash before committing both files together.
+
+
+### Simplified Option 5
+
+Option 5 now opens a single CRIS status screen. Check status first. Choose
+Install / Repair both + desktop switcher only when installation is needed, then
+approve UAC and the existing setup review. Both signer cards show their verified
+state and port with Start / Switch and Stop controls. Package tools and session
+details are collapsed initially. Create desktop switcher only is a separate,
+approved action when installation is not required.
+
+The desktop CRIS Signer Switcher uses `-Mode crisswitch`: a compact switcher-only
+view, without installer/package controls, and the shortcut continues to request UAC.
+Installation validation, separate folders, port checks, cancel behavior and the
+existing download-before-uninstall safeguards remain in place.

@@ -34,6 +34,8 @@ try{
  $script:Routes=@();$script:EngineFetches=0
  & ([scriptblock]::Create($safe)) -Mode apargui
  Assert-Launcher ($script:EngineFetches -eq 1 -and $script:Routes.Count -eq 1 -and $script:Routes[0] -eq 'apargui') 'direct apargui argument preserves APAR routing through lazy loading'
+ $script:Routes=@();$script:EngineFetches=0; & ([scriptblock]::Create($safe)) -Mode crisswitch
+ Assert-Launcher ($script:EngineFetches -eq 1 -and $script:Routes.Count -eq 1 -and $script:Routes[0] -eq 'crisswitch') 'desktop switcher mode routes through lazy loading'
  $script:Choices=New-Object 'Collections.Generic.Queue[string]';$script:Choices.Enqueue('6');$script:Choices.Enqueue('7')
  $script:Routes=@();$script:FailLoad=$true
  & ([scriptblock]::Create($safe))
