@@ -1,7 +1,7 @@
-# Simulation-only: no real repairs, installers, firewall or security changes.
+﻿# Simulation-only: no real repairs, installers, firewall or security changes.
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
-$source=[IO.File]::ReadAllText((Join-Path $repo 'install.ps1'))
+$source=[IO.File]::ReadAllText((Join-Path $repo 'troubleshooter.ps1'))
 $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
 function Get-Function($name){$n=$ast.Find({param($x)$x -is [Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $name}.GetNewClosure(),$true);$n.Extent.Text}
 foreach($name in 'Invoke-Fixes','Show-InitialPendingReview'){. ([scriptblock]::Create((Get-Function $name)))}

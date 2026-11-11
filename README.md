@@ -1,4 +1,4 @@
-# Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )
+﻿# Digital Signing Service 4.1.8 Troubleshooter ( for E-Office )
 
 > Current local build: **2026.11.04.2**. All editions now support permission-based DSS installer downloads. Earlier local-package-only capability notes below are superseded by the Download permission and repository backups section.
 
@@ -139,3 +139,44 @@ Both copies are unsigned. Pins identify the exact packages downloaded from the u
 ## Optional browser bookmark and startup settings
 
 The existing Option 2 full GUI provides one optional **DSC islive Check - Bookmark / Startup setup** button. No additional startup-menu option or duplicate Option 3 action is added. Select Chrome, Edge and/or Firefox and choose bookmark and/or startup setup. Selections default unchecked and confirmations default Cancel. Each selected browser receives its own Continue / Cancel instructions. A one-link HTML import file is prepared for **DSC islive Check** after approval; the browser can import it or the user can bookmark the opened isLive page with Ctrl+D. Startup settings open for the user to append the DSC URL while retaining existing pages. Existing browser databases, organization policies and session-restore modes are never overwritten. Setup is recorded as pending user action, not as a verified saved setting. Certificate warnings and signer startup timing remain separate.
+
+
+### Option 6 — APAR Signer Service 7.0.2
+
+Choose Option 6 for the APAR Windows GUI; Option 7 exits. The standalone mode is
+`powershell.exe -NoProfile -STA -File .\install.ps1 -Mode apargui`.
+
+APAR checks `https://eoffsigner.eoffice.gov.in:55103/check/isLive` and the separate
+`C:\Program Files\Digital Signer Service\7.0.2\Digital Signer Service.exe` installation.
+E-Office 4.1.8 remains on port 55101. Both supported versions are retained; the selected
+profile limits signer process control, package selection and startup tasks to its version.
+
+After default-No approval, the APAR installer downloads to Downloads\DSC-Signer-7.0.2
+from the configured Google Drive file, with its same-file confirmation URL as fallback.
+The mapped MSI must match the inspected SHA256, valid signature and product/upgrade IDs.
+Changed packages need review and a new inspected pin. Reviewed installation uses silent
+MSI execution, a version-specific APPDIR and verbose dss-install.log. APAR uses its own
+bundled Java; an optional system Java update remains a separate user action.
+
+Before installation, MSI related-product metadata is checked for cross-version removal.
+The APAR installer is also instructed not to perform its vendor upgrade-removal action.
+After installation, an existing peer executable and a previously working peer endpoint
+are rechecked. Failures are reported for review, with no automatic rollback or uninstallation.
+Actual side-by-side installation still requires validation on a Windows test machine.
+
+
+### Online menu first
+
+The existing two-line online command still uses `install.ps1`. It now downloads only
+the small menu launcher. Selecting an option loads the SHA256-verified shared engine
+and opens that selected console/GUI. Refresh and Exit do not download the engine.
+The engine is reused in memory during the same menu session. Download failures show
+elapsed time, retry guidance and local launcher logs; the engine is never executed
+if its hash or syntax check fails. Network/DNS latency before the initial menu remains
+outside the script's control. The launcher does not install software by itself.
+
+`troubleshooter.ps1` is the full source and local/offline entry point. The downloadable
+website ZIP contains that full script as Windows-Troubleshooter.ps1. A local repository
+launch uses the matching sibling engine without another download. After changing
+troubleshooter.ps1, run `powershell.exe -NoProfile -File .\tools\build-launcher.ps1`
+to update the launcher's embedded engine hash before committing both files together.

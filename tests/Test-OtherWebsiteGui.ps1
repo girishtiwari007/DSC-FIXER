@@ -1,7 +1,7 @@
 ﻿# Fixture-only tests: never alter Java, browser settings, or install software.
 $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSScriptRoot
-$source=[IO.File]::ReadAllText((Join-Path $root 'install.ps1'))
+$source=[IO.File]::ReadAllText((Join-Path $root 'troubleshooter.ps1'))
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'Source parse failed'}
@@ -55,7 +55,7 @@ $IsAdmin=$true
 function Invoke-JavaVersion($exe){@{Code=1;Text='corrupt fixture'}}
 Invoke-OtherJavaRepair -Confirmed
 Assert-Other ($script:JavaRepairs -eq 1) 'broken shared Java enters approved repair path'
-Assert-Other ($source -match "'3' \{ Invoke-DscSelection 'othergui' \}" -and $source -match "'6' \{ return \}") 'menu Option 3 opens dedicated GUI and Option 6 exits'
+Assert-Other ($source -match "'3' \{ Invoke-DscSelection 'othergui' \}" -and $source -match "'7' \{ return \}") 'menu Option 3 opens dedicated GUI and Option 7 exits'
 # Construct the actual form, inspect defaults, then dispose without showing or repairing.
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 $gui=Function-Text 'Start-OtherGui'

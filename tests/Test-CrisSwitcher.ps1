@@ -1,6 +1,6 @@
-# Fixtures only: no real processes, installers, browsers, shortcuts or ports are changed.
+﻿# Fixtures only: no real processes, installers, browsers, shortcuts or ports are changed.
 $ErrorActionPreference='Stop';$root=Split-Path -Parent $PSScriptRoot
-$source=[IO.File]::ReadAllText((Join-Path $root 'install.ps1'));$tokens=$null;$errors=$null
+$source=[IO.File]::ReadAllText((Join-Path $root 'troubleshooter.ps1'));$tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors);if($errors.Count){throw 'Parse failed'}
 $script:Count=0
 function Assert-Cris($ok,$label){if(-not $ok){throw "FAIL: $label"};$script:Count++;Write-Host "PASS: $label"}
@@ -68,7 +68,7 @@ $threw=$false;try{Install-CrisPlanned $a $b -Confirmed}catch{$threw=$true};Asser
 function Get-UninstallEntries{@()}
 $script:Exists=$false;$threw=$false;try{Install-CrisPlanned $a $b -Confirmed}catch{$threw=$true};Assert-Cris $threw 'installer success without target executable is not reported as validated';$script:Exists=$true
 $NativeSourcePath=$null;$threw=$false;try{Save-CrisDesktopSwitcher -Confirmed}catch{$threw=$true};Assert-Cris $threw 'in-memory source cannot create a misleading desktop shortcut'
-Assert-Cris ($source -match "'5' \{ Invoke-DscSelection 'crisgui' \}" -and $source -match "'6' \{ return \}") 'Option 5 opens switcher and Option 6 exits'
+Assert-Cris ($source -match "'5' \{ Invoke-DscSelection 'crisgui' \}" -and $source -match "'7' \{ return \}") 'Option 5 opens switcher and Option 7 exits'
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 $gui=Read-CrisFunction 'Start-CrisGui'
 $gui=$gui.Replace('[void]$f.ShowDialog()',@'

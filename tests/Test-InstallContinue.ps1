@@ -1,7 +1,7 @@
-# Fixtures only: no real network, process changes, installers or repairs.
+﻿# Fixtures only: no real network, process changes, installers or repairs.
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
-$source=[IO.File]::ReadAllText((Join-Path $repo 'install.ps1'))
+$source=[IO.File]::ReadAllText((Join-Path $repo 'troubleshooter.ps1'))
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'Source syntax failed'}

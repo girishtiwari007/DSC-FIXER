@@ -1,9 +1,9 @@
-# Isolated temporary hosts fixtures; never reads or writes the system hosts file.
+﻿# Isolated temporary hosts fixtures; never reads or writes the system hosts file.
 $ErrorActionPreference='Stop'
 $root=Join-Path $env:TEMP ('DSS-Hosts-'+[guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($root)
 $repo=Split-Path -Parent $PSScriptRoot
-$source=[IO.File]::ReadAllText((Join-Path $repo 'install.ps1'))
+$source=[IO.File]::ReadAllText((Join-Path $repo 'troubleshooter.ps1'))
 $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
 foreach($name in 'Get-HostsPath','Resolve-Signer','Test-Hosts','Repair-Hosts'){
  $n=$ast.Find({param($x)$x -is [Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $name}.GetNewClosure(),$true)

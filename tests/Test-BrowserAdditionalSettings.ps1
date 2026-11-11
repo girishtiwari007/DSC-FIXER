@@ -1,12 +1,13 @@
-# Fixtures only. No actual browser, clipboard, startup setting or bookmark database changes.
+﻿# Fixtures only. No actual browser, clipboard, startup setting or bookmark database changes.
 $ErrorActionPreference='Stop';$root=Split-Path -Parent $PSScriptRoot
-$source=[IO.File]::ReadAllText((Join-Path $root 'install.ps1'));$t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$t,[ref]$e);if($e.Count){throw 'Source parse failed'}
+$source=[IO.File]::ReadAllText((Join-Path $root 'troubleshooter.ps1'));$t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$t,[ref]$e);if($e.Count){throw 'Source parse failed'}
 $script:Pass=0
 function Assert-Browser($ok,$name){if(-not $ok){throw "FAIL: $name"};$script:Pass++;Write-Host "PASS: $name"}
 function Browser-Function($name){$n=$ast.Find({param($x)$x -is [Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $name},$true);if(-not $n){throw "Missing $name"};$n.Extent.Text}
 foreach($name in 'Get-DscBrowserSetupDefinition','New-DscBookmarkImportFile','Get-DscBrowserSetupInstructions','Open-DscBrowserAdditionalSettings'){
  . ([scriptblock]::Create((Browser-Function $name)))
 }
+$Cfg=@{IsLiveUrl='https://eoffsigner.eoffice.gov.in:55101/check/isLive'}
 $RunDir=Join-Path $env:TEMP ('DscBrowserSetup-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($RunDir)
 $TestMode=$false;$script:Opened=@();$script:Events=@();$script:Prompts=@();$script:Decline=$false
 function Start-Process{param($FilePath,$ArgumentList,$ErrorAction)$script:Opened+=@{Exe=$FilePath;Url=$ArgumentList}}

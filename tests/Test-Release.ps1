@@ -27,7 +27,7 @@ function Get-TestHash([string]$Path) {
     finally { $sha.Dispose() }
 }
 $entry = Join-Path $taskRoot 'native.ps1'
-if (-not (Test-Path -LiteralPath $entry)) { $entry = Join-Path $taskRoot 'install.ps1' }
+if (-not (Test-Path -LiteralPath $entry)) { $entry = Join-Path $taskRoot 'troubleshooter.ps1' }
 $entryAst = Get-SourceAst ([IO.File]::ReadAllText($entry))
 $helper = (@('Initialize-DscSession','Write-DscEvent','Write-DscError','Save-DscSession','Get-DscPublicReport','Show-DscGitHubReport') | ForEach-Object { Get-FunctionText $entryAst $_ }) -join "`n"
 
@@ -89,6 +89,9 @@ foreach ($file in $files) {
             $script:RequestPackage=$null;$TestMode=$false;$RunDir=$env:DSSF_TESTROOT
             function Get-DssPackageMsi { if($script:HasPackage){'fixture.msi'} }
             function Test-PackageValid { param($p) @{Ok=$script:Valid;Text='fixture'} }
+            function Assert-DssMsiCoexistence {param($p)}
+            function Get-DssPeerSnapshot {@{}}
+            function Assert-DssPeerPreserved {param($p)}
             function Stop-Dss { param($r) $script:Stopped++ }
             function Invoke-Exe { param($File,$ArgumentLine) $script:Calls += $ArgumentLine; return $script:ExitCode }
             function Add-Action { param($r,$text) $script:Actions += $text }
@@ -129,7 +132,7 @@ foreach ($file in $files) {
             Assert ($Defs[0].R.Status -eq 'WARN' -and $Defs[1].R.Status -eq 'OK') "$label diagnostics continue after an exception"
         } $ast ($file.Directory.Name+'/'+$file.Name)
     }
-    if ($file.Name -eq 'install.ps1' -and $file.Directory.Name -eq 'DSC-FIX') {
+    if ($file.Name -eq 'troubleshooter.ps1' -and $file.Directory.Name -eq 'DSC-FIX') {
         $m=[regex]::Match($source,"FromBase64String\('([^']+)'\)")
         $payload=[Convert]::FromBase64String($m.Groups[1].Value)
         $sha=[Security.Cryptography.SHA256]::Create()
@@ -137,7 +140,7 @@ foreach ($file in $files) {
         Assert ($hash -eq (Get-TestHash (Join-Path $file.Directory.FullName 'DSC_Signer_OneClick_Fix.bat'))) 'embedded payload matches patched batch'
         Assert ($source.Contains("if (`$hash -ne '$hash')")) 'embedded integrity constant updated'
     }
-    if ($file.Name -eq 'native.ps1' -or ($file.Name -eq 'install.ps1' -and $file.Directory.Name -eq 'DSC-FIXER')) {
+    if ($file.Name -eq 'native.ps1' -or ($file.Name -eq 'troubleshooter.ps1' -and $file.Directory.Name -eq 'DSC-FIXER')) {
         & {
             param($ast,$source,$label)
             $node=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-DscNative'},$true)
@@ -150,7 +153,7 @@ foreach ($file in $files) {
                 $doc=Get-Content (Join-Path $script:DscSessionDirectory 'session.json') -Raw | ConvertFrom-Json
                 Assert ($doc.State -eq 'Completed') "$label finalizes $modeName session"
             }
-            function Read-Host { param($Prompt) return '6' }
+            function Read-Host { param($Prompt) return '7' }
             & ([scriptblock]::Create($safe))
             Assert ($script:DscSession.State -eq 'Completed') "$label menu exit finalizes session"
         } $ast $source ($file.Directory.Name+'/'+$file.Name)
@@ -170,7 +173,7 @@ foreach ($repo in @((Split-Path -Leaf $taskRoot))) {
     if (-not (Test-Path -LiteralPath $app)) {
         $app=Join-Path $taskRoot 'native.ps1'
         if (-not (Test-Path -LiteralPath $app)) { $app=Join-Path $taskRoot 'DSC_Signer_OneClick_Fix.bat' }
-        if (-not (Test-Path -LiteralPath $app)) { $app=Join-Path $taskRoot 'install.ps1' }
+        if (-not (Test-Path -LiteralPath $app)) { $app=Join-Path $taskRoot 'troubleshooter.ps1' }
     }
     $appAst=Get-SourceAst ([IO.File]::ReadAllText($app))
     . ([scriptblock]::Create((Get-FunctionText $appAst 'Wait-Proc')))
@@ -194,7 +197,7 @@ Show-DscGitHubReport -UseGui
     if (-not (Test-Path -LiteralPath $app)) {
         $app=Join-Path $taskRoot 'native.ps1'
         if (-not (Test-Path -LiteralPath $app)) { $app=Join-Path $taskRoot 'DSC_Signer_OneClick_Fix.bat' }
-        if (-not (Test-Path -LiteralPath $app)) { $app=Join-Path $taskRoot 'install.ps1' }
+        if (-not (Test-Path -LiteralPath $app)) { $app=Join-Path $taskRoot 'troubleshooter.ps1' }
     }
     $appAst=Get-SourceAst ([IO.File]::ReadAllText($app))
     foreach($name in 'New-UiFont','Get-SysColor','New-Result') { . ([scriptblock]::Create((Get-FunctionText $appAst $name))) }
@@ -210,7 +213,7 @@ Show-DscGitHubReport -UseGui
 }
 # Exercise checksum decisions without downloading anything or launching the tool.
 $launcher=Join-Path $taskRoot 'no-online-launcher.ps1'
-if ((Split-Path -Leaf $taskRoot) -eq 'DSC-FIXR') { $launcher=Join-Path $taskRoot 'install.ps1' }
+if ((Split-Path -Leaf $taskRoot) -eq 'DSC-FIXR') { $launcher=Join-Path $taskRoot 'troubleshooter.ps1' }
 if (Test-Path -LiteralPath $launcher) {
     $launchSource=[IO.File]::ReadAllText($launcher)
     $begin=$launchSource.IndexOf('# ---- 1.')

@@ -1,4 +1,5 @@
 ﻿# Tests construct the actual dashboard without showing a window or changing the system.
+param([switch]$Apar)
 $ErrorActionPreference='Stop'
 $repositoryRoot=Split-Path -Parent $PSScriptRoot
 $script:ReviewPass=0
@@ -37,7 +38,8 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
   $selection=@(Request-ConsoleReview $proposals)
   Assert-Review ($selection.Count -eq 1 -and $selection[0] -eq 5 -and -not $script:ReviewApproved) "$label explicit console apply returns only the reviewed stable IDs"
 
-  $Cfg=@{DssVersion='4.1.8';Port=55101;EditionName='Test edition';IsLiveUrl='https://eoffsigner.eoffice.gov.in:55101/check/isLive';LnaAllowedOrigins=@('[*.]eoffice.gov.in')}
+  $Cfg=@{RequiredDssPath='C:\Program Files\Digital Signer Service\4.1.8\Digital Signer Service.exe';DssVersion='4.1.8';Port=55101;EditionName='Test edition';IsLiveUrl='https://eoffsigner.eoffice.gov.in:55101/check/isLive';LnaAllowedOrigins=@('[*.]eoffice.gov.in')}
+  if($Apar){$Cfg.DssVersion='7.0.2';$Cfg.Port=55103;$Cfg.EditionName='Test edition APAR 7.0.2';$Cfg.RequiredDssPath='C:\Program Files\Digital Signer Service\7.0.2\Digital Signer Service.exe';$Cfg.IsLiveUrl='https://eoffsigner.eoffice.gov.in:55103/check/isLive'}
   $Results=[ordered]@{};$Defs=@();$ByNo=@{}
   $assignment=$ast.Find({param($x)$x -is [Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -eq '$Defs'},$true)
   $Defs=& ([scriptblock]::Create('return '+$assignment.Right.Extent.Text))
@@ -82,7 +84,7 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
     Assert-Review ($G.Battery.Value -eq 10 -and $G.ProgressDone.Count -eq 1) 'duplicate row events do not inflate progress'
     & $script:UiProgress 'begin-repairs' $null 2
     & $script:UiProgress 'repairing' $ByNo[3] 0
-    Assert-Review ($G.ProgressPhase -eq 'Repairs' -and $G.Battery.Value -eq 0 -and $G.Target.Text.Contains('4.1.8')) 'repair phase resets battery and shows installation target'
+    Assert-Review ($G.ProgressPhase -eq 'Repairs' -and $G.Battery.Value -eq 0 -and $G.Target.Text.Contains($Cfg.DssVersion)) 'repair phase resets battery and shows installation target'
     & $script:UiProgress 'repaired' $ByNo[3] 0
     Assert-Review ($G.Battery.Value -eq 50 -and $G.Prog.Value -eq 50) 'battery and status strip count completed repair attempts'
     & $script:UiProgress 'cancelled' $null 0
@@ -90,7 +92,8 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
     $onShown=$f.GetType().GetMethod('OnShown',[Reflection.BindingFlags]'Instance,NonPublic')
     [void]$onShown.Invoke($f,@([EventArgs]::Empty))
     Assert-Review ($script:GuiDiagnostics -eq 1 -and $script:GuiReview -eq 1 -and $script:GuiRepairs -eq 0) 'actual GUI startup completes diagnostics then opens review without repairs'
-    Assert-Review ($f.Text.Contains('Test edition') -and $f.Text.Contains('Build 2026.11.04.2')) 'actual window title identifies edition and exact build'
+    Assert-Review ($f.Text.Contains('Test edition') -and $f.Text.Contains('Build 2026.11.11.1')) 'actual window title identifies edition and exact build'
+    if($Apar){Assert-Review ($t1.Text.Contains('APAR 7.0.2') -and $f.Text.Contains('DSS 7.0.2')) 'APAR GUI heading and window identify 7.0.2';Assert-Review ($G.Target.Text.Contains('7.0.2')) 'APAR GUI progress targets its own installation'}
     Assert-Review ($G.Live.Text.StartsWith('Signer service: WORKING') -and $G.Findings.Text.StartsWith('Other checks: 1 need attention')) 'actual dashboard shows service and other checks separately'
     Assert-Review ($G.BFix.Text -eq 'Review / Pending fixes ...') 'main action explicitly reviews before applying'
     $onClick=$G.BTest.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic')

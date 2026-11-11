@@ -1,7 +1,7 @@
-# Fixture downloads only. No real network or installer execution.
+﻿# Fixture downloads only. No real network or installer execution.
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
-$source=[IO.File]::ReadAllText((Join-Path $repo 'install.ps1'))
+$source=[IO.File]::ReadAllText((Join-Path $repo 'troubleshooter.ps1'))
 $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
 foreach($name in 'Confirm-DssDownload','Get-DssPackageFromWeb'){
  $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}.GetNewClosure(),$true)

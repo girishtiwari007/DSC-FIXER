@@ -1,6 +1,6 @@
 ﻿# Isolated one-click sequence fixtures. Never installs, uninstalls, or changes shortcuts.
 $ErrorActionPreference='Stop';$root=Split-Path -Parent $PSScriptRoot
-$source=[IO.File]::ReadAllText((Join-Path $root 'install.ps1'));$t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$t,[ref]$e);if($e.Count){throw 'Source parse failed'}
+$source=[IO.File]::ReadAllText((Join-Path $root 'troubleshooter.ps1'));$t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$t,[ref]$e);if($e.Count){throw 'Source parse failed'}
 $script:Pass=0
 function Assert-Setup($ok,$name){if(-not $ok){throw "FAIL: $name"};$script:Pass++;Write-Host "PASS: $name"}
 foreach($name in 'Get-CrisKnownPackages','Test-CrisKnownPackage','Get-CrisCatalog','Get-CrisDefinition','Get-CrisExistingProducts','Assert-CrisCoexistence','Invoke-CrisSetupBoth'){

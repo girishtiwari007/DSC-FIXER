@@ -1,4 +1,4 @@
-# Fixture-only workflow tests: no network, browsers, installers, trust stores or repairs.
+﻿# Fixture-only workflow tests: no network, browsers, installers, trust stores or repairs.
 $ErrorActionPreference='Stop'
 $repositoryRoot=Split-Path -Parent $PSScriptRoot
 $fixtureRoot=Join-Path $env:TEMP ('DSC-WorkflowTests-' + [guid]::NewGuid().ToString('N'))
@@ -120,7 +120,7 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
         $expectedDownload=$true
         Assert-Workflow ($source.Contains('AllowDssDownload    = $'+$expectedDownload.ToString().ToLowerInvariant())) "$label offers permission-based DSS downloads"
         Assert-Workflow ($source.Contains('if ($Cfg.AllowDssDownload -and $env:DSSF_PKGURL)')) "$label inherited URL cannot enable an unsupported download"
-        Assert-Workflow ($source.Contains("`$Cfg.RequiredDssPath = 'C:\Program Files\Digital Signer Service\4.1.8\Digital Signer Service.exe'")) "$label checks the required Program Files path"
+        Assert-Workflow ($source.Contains('Set-DssProfile $Cfg $RequestedMode') -and $source.Contains('C:\Program Files\Digital Signer Service\$($Config.DssVersion)\Digital Signer Service.exe')) "$label checks the required Program Files path"
         Assert-Workflow ($source.Contains('another installation at') -and -not $source.Contains('$installed = $true; $exe = $other')) "$label alternate path does not count as the required installation"
 
         # Run actual GUI/console dispatchers with diagnostic, browser and preparation fixtures.
@@ -165,7 +165,7 @@ foreach($file in (Get-ChildItem -LiteralPath $repositoryRoot -File | Where-Objec
     } $ast $source $file.Name $file.Directory.Name $fixtureRoot
 }
 if((Split-Path -Leaf $repositoryRoot) -eq 'DSC-FIXR') {
-    $online=[IO.File]::ReadAllText((Join-Path $repositoryRoot 'install.ps1'))
+    $online=[IO.File]::ReadAllText((Join-Path $repositoryRoot 'troubleshooter.ps1'))
     Assert-Workflow ($online.Contains("`$downloads = Join-Path (Get-DownloadsFolder) 'DSC-Signer-4.1.8'")) 'FIXR explicit package preparation also uses Downloads'
     Assert-Workflow ($online.Contains("`$env:DSSF_PKGURL = `$(if (`$NoPackage) { '' } else { `$PackageUrl })")) 'FIXR NoPackage disables subsequent DSS downloads'
 }

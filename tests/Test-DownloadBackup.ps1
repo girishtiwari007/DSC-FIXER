@@ -1,4 +1,4 @@
-# Isolated fixtures: no network, installed application changes or real installer execution.
+﻿# Isolated fixtures: no network, installed application changes or real installer execution.
 $ErrorActionPreference='Stop'
 $repositoryRoot=Split-Path -Parent $PSScriptRoot
 $fixtureRoot=Join-Path $env:TEMP ('DSC-DownloadBackup-'+[guid]::NewGuid().ToString('N'))
@@ -83,7 +83,10 @@ foreach($file in (Get-ChildItem $repositoryRoot -File | Where-Object Extension -
   function Get-DssPackageMsi {'approved-installer.msi'}
   function Test-PackageValid {param($p)@{Ok=$true;Text='fixture valid'}}
   function Test-DssInstall {@{Old=@();Good=@();Exe=''}}
-  function Stop-Dss {param($r)$script:Stopped++}
+  function Assert-DssMsiCoexistence {param($p)}
+            function Get-DssPeerSnapshot {@{}}
+            function Assert-DssPeerPreserved {param($p)}
+            function Stop-Dss {param($r)$script:Stopped++}
   function Invoke-Exe {param($file,$arguments)$script:Executions++;return 0}
   $old=[pscustomobject]@{DisplayName='Old DSS';DisplayVersion='4.0.0';UninstallString='msiexec /x {01234567-0123-0123-0123-012345678901}'}
   & {
